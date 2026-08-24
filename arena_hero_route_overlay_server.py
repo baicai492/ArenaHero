@@ -10,6 +10,27 @@ from typing import Any
 
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+# 与 arena_hero_strategy 的 DEFAULT_TARGET_POPULATION / DEFAULT_COMPOSITION_* 对齐：
+# develop 目标编制阶梯的第一级，20 人 12:4:4。
+CONTROL_NUMBER_DEFAULTS = {
+    "raid_vanguards": 1,
+    "raid_rangers": 2,
+    "beacon_target_distance": 0,
+    "aggress_vanguards": 0,
+    "aggress_rangers": 0,
+    "target_population": 20,
+    "composition_workers": 12,
+    "composition_vanguards": 4,
+    "composition_rangers": 4,
+    "browser_hint_distance": 32,
+}
+CONTROL_FLAG_DEFAULTS = {
+    "raid_enabled": False,
+    "raid_recall": False,
+    "ally_support_enabled": False,
+    "hoard_stage1": False,
+    "hoard_stage2": False,
+}
 EMPTY_ROUTES = {
     "version": 2,
     "tick": 0,
@@ -34,6 +55,18 @@ EMPTY_STATS = {
     "migration_target": None,
     "migration_site_checked": False,
     "migration_site_score": 0,
+    "hoard_stage1": False,
+    "hoard_stage2": False,
+    "hoard_target": 0,
+    "target_population": 20,
+    "composition_workers": 12,
+    "composition_vanguards": 4,
+    "composition_rangers": 4,
+    "browser_hint_distance": 32,
+    "effective_target_population": 20,
+    "effective_workers": 12,
+    "effective_vanguards": 4,
+    "effective_rangers": 4,
     "resources": 0,
     "capacity": 0,
     "population": 0,
@@ -370,32 +403,39 @@ def _normalize_stats(payload: Any) -> dict[str, Any]:
     return result
 
 
+def _default_control() -> dict[str, Any]:
+    """控制文件缺失或损坏时的完整默认配置。
+
+    三个兜底分支（文件不存在、顶层不是 dict、解析异常）共用同一张表，避免像
+    ally_support_enabled 那样只出现在部分分支、导致字段随读取路径漂移。
+    """
+
+    return {
+        "mode": "develop",
+        "recall": False,
+        "rally_point": None,
+        **CONTROL_FLAG_DEFAULTS,
+        **CONTROL_NUMBER_DEFAULTS,
+    }
+
+
+def _clamped_int(raw_value: Any, default: int) -> int:
+    """读取非负整数配置；类型不符时回退默认值。"""
+
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        return max(0, int(raw_value))
+    return default
+
+
 def load_control(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return {
-                "mode": "develop",
-                "recall": False,
-                "raid_enabled": False,
-                "raid_recall": False,
-                "raid_vanguards": 1,
-                "raid_rangers": 2,
-                "beacon_target_distance": 0,
-            }
+            return _default_control()
         mode = data.get("mode", "develop")
         if mode not in VALID_MODES:
             mode = "develop"
         recall = data.get("recall", False)
-        raid_enabled = data.get("raid_enabled", False)
-        raid_recall = data.get("raid_recall", False)
-        raw_distance = data.get("beacon_target_distance", 0)
-        distance = (
-            max(0, int(raw_distance))
-            if isinstance(raw_distance, (int, float))
-            and not isinstance(raw_distance, bool)
-            else 0
-        )
         raw_rally = data.get("rally_point")
         rally = None
         if (
@@ -407,9 +447,6 @@ def load_control(path: Path) -> dict[str, Any]:
         result: dict[str, Any] = {
             "mode": mode,
             "recall": bool(recall),
-            "raid_enabled": bool(raid_enabled),
-            "raid_recall": bool(raid_recall),
-            "beacon_target_distance": distance,
             "rally_point": rally,
         }
         if "migration_candidate" in data or "auto_migrate" in data:
@@ -417,40 +454,13 @@ def load_control(path: Path) -> dict[str, Any]:
                 data.get("migration_candidate")
             )
             result["auto_migrate"] = bool(data.get("auto_migrate", False))
-        result["ally_support_enabled"] = bool(
-            data.get("ally_support_enabled", False)
-        )
-        for key in ("aggress_vanguards", "aggress_rangers"):
-            raw_value = data.get(key, 0)
-            result[key] = (
-                max(0, int(raw_value))
-                if isinstance(raw_value, (int, float))
-                and not isinstance(raw_value, bool)
-                else 0
-            )
-        for key, default in (("raid_vanguards", 1), ("raid_rangers", 2)):
-            raw_value = data.get(key, default)
-            result[key] = (
-                max(0, int(raw_value))
-                if isinstance(raw_value, (int, float))
-                and not isinstance(raw_value, bool)
-                else default
-            )
+        for key, default in CONTROL_FLAG_DEFAULTS.items():
+            result[key] = bool(data.get(key, default))
+        for key, default in CONTROL_NUMBER_DEFAULTS.items():
+            result[key] = _clamped_int(data.get(key, default), default)
         return result
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return {
-            "mode": "develop",
-            "recall": False,
-            "raid_enabled": False,
-            "raid_recall": False,
-            "raid_vanguards": 1,
-            "raid_rangers": 2,
-            "beacon_target_distance": 0,
-            "rally_point": None,
-            "aggress_vanguards": 0,
-            "aggress_rangers": 0,
-            "ally_support_enabled": False,
-        }
+        return _default_control()
 
 
 def save_control(
@@ -464,14 +474,6 @@ def save_control(
     payload = load_control(path)
     payload.update({"mode": mode, "recall": bool(recall)})
     if data is not None:
-        if "beacon_target_distance" in data:
-            raw_distance = data["beacon_target_distance"]
-            if not isinstance(raw_distance, (int, float)) or isinstance(
-                raw_distance,
-                bool,
-            ):
-                raise ValueError("beacon_target_distance must be a number")
-            payload["beacon_target_distance"] = max(0, int(raw_distance))
         if "rally_point" in data:
             raw_rally = data["rally_point"]
             if raw_rally is None:
@@ -501,13 +503,13 @@ def save_control(
             if not isinstance(data["auto_migrate"], bool):
                 raise ValueError("auto_migrate must be boolean")
             payload["auto_migrate"] = data["auto_migrate"]
-        for key in ("raid_enabled", "raid_recall"):
+        for key in CONTROL_FLAG_DEFAULTS:
             if key not in data:
                 continue
             if not isinstance(data[key], bool):
                 raise ValueError(f"{key} must be boolean")
             payload[key] = data[key]
-        for key in ("aggress_vanguards", "aggress_rangers"):
+        for key in CONTROL_NUMBER_DEFAULTS:
             if key not in data:
                 continue
             raw_value = data[key]
@@ -515,13 +517,6 @@ def save_control(
                 raw_value,
                 bool,
             ):
-                raise ValueError(f"{key} must be a number")
-            payload[key] = max(0, int(raw_value))
-        for key in ("raid_vanguards", "raid_rangers"):
-            if key not in data:
-                continue
-            raw_value = data[key]
-            if not isinstance(raw_value, (int, float)) or isinstance(raw_value, bool):
                 raise ValueError(f"{key} must be a number")
             payload[key] = max(0, int(raw_value))
     path.parent.mkdir(parents=True, exist_ok=True)

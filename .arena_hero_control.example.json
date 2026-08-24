@@ -10,5 +10,13 @@
   "migration_candidate": null,
   "auto_migrate": false,
   "aggress_vanguards": 0,
-  "aggress_rangers": 0
+  "aggress_rangers": 0,
+  "ally_support_enabled": false,
+  "hoard_stage1": false,
+  "hoard_stage2": false,
+  "target_population": 20,
+  "composition_workers": 12,
+  "composition_vanguards": 4,
+  "composition_rangers": 4,
+  "browser_hint_distance": 32
 }

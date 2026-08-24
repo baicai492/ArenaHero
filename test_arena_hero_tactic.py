@@ -56,6 +56,11 @@ from arena_hero_strategy import (
     BEACON_RESOURCE_SWEEP_INITIAL_RADIUS,
     BEACON_RESOURCE_SWEEP_MAX_RADIUS,
     BROWSER_RESOURCE_HINT_MAX_DISTANCE,
+    COMPOSITION_STAGE2_POPULATION,
+    COMPOSITION_STAGE2_RANGERS,
+    COMPOSITION_STAGE2_VANGUARDS,
+    COMPOSITION_STAGE2_WORKERS,
+    CONTINUOUS_GROWTH_PROFILE,
     CORE_MIGRATION_CARGO_BACKLOG_LIMIT,
     CORE_MIGRATION_CARGO_SERVICE_RADIUS,
     CORE_MIGRATION_HEAL_SERVICE_RADIUS,
@@ -69,6 +74,10 @@ from arena_hero_strategy import (
     DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE,
     DEVELOP_WIDE_SEARCH_MAX_RADIUS,
     EnemySighting,
+    HOARD_STAGE1_POPULATION,
+    HOARD_STAGE1_RESOURCE_TARGET,
+    HOARD_STAGE2_POPULATION,
+    HOARD_STAGE2_RESOURCE_TARGET,
     HealRotation,
     HealRoleSwap,
     MODE_AGGRESS,
@@ -91,7 +100,12 @@ from arena_hero_strategy import (
     _core_attack_surface_profile,
     _core_logistics_corridor,
     _distance,
+    _effective_composition,
+    _effective_growth_profile,
+    _effective_target_population,
+    _hoard_resource_target,
     _refill_tick_at_or_after,
+    _split_population,
     _terrain_guard_offsets,
 )
 
@@ -162,6 +176,16 @@ VANGUARD_FOURTH_ID = UUID("00000000-0000-4000-8000-000000000016")
 ENEMY_CORE_ID = UUID("00000000-0000-4000-8000-000000000200")
 ENEMY_RANGER_ID = UUID("00000000-0000-4000-8000-000000000201")
 ENEMY_VANGUARD_ID = UUID("00000000-0000-4000-8000-000000000202")
+
+
+def _ladder_uuid(index: int) -> UUID:
+    """为编制阶梯/囤积测试批量生成单位 ID。
+
+    这些用例需要凑够 20~30 人的编制，逐个声明常量不现实；用 0x300 起的独立段落
+    避免和上面手写的固定 ID 撞号。
+    """
+
+    return UUID(f"00000000-0000-4000-8000-{0x300 + index:012x}")
 
 
 def core(
@@ -1475,8 +1499,13 @@ class BalancedTacticTests(unittest.TestCase):
             resources=21,
         )
 
-        SmartTactic(TacticMemory()).choose_actions(turn)
+        # 目标人口设为 0 关闭编制阶梯：阶梯生效期间会押后抢信标，见
+        # CompositionLadderTests.test_active_ladder_postpones_beacon_expedition。
+        memory = TacticMemory()
+        memory.target_population = 0
+        SmartTactic(memory).choose_actions(turn)
 
+        self.assertEqual(memory.mode, MODE_BEACON)
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
         self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
 
@@ -2873,6 +2902,87 @@ class BalancedTacticTests(unittest.TestCase):
 
         self.assertTrue(memory.browser_intel_online)
         self.assertEqual(memory.browser_resource_hints, set())
+
+    def _write_intel(self, path: Path, resources: list) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source": "browser",
+                    "captured_at": datetime.now(timezone.utc).isoformat(),
+                    "resources": resources,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_distance_filter_runs_before_quota_check(self) -> None:
+        """核心回归：远处成片误报不得连坐否决近处真实水晶。
+
+        浏览器读的是游戏客户端 React 状态，其中保留了所有浏览过区域的地形数据。
+        实测一次快照 790 个坐标里 97% 是几百到四千格外的成片地形，若先做配额
+        检查，这些远处误报会让整批数据被丢弃，近处的水晶一起没了。
+        """
+
+        far_terrain = [
+            [1000 + dx, 1000 + dy] for dx in range(20) for dy in range(20)
+        ]
+        near_crystal = [10, 0]
+        with TemporaryDirectory() as directory:
+            intel_path = Path(directory) / "browser-intel.json"
+            self._write_intel(intel_path, far_terrain + [near_crystal])
+
+            # 不给 origin：退化成旧行为，远处误报让整批被配额否决
+            without_origin = TacticMemory(mode=MODE_DEVELOP)
+            without_origin.refresh_browser_intel(intel_path)
+
+            # 给 origin：远处先被距离过滤剔除，近处水晶得以保留
+            with_origin = TacticMemory(mode=MODE_DEVELOP)
+            with_origin.refresh_browser_intel(intel_path, origin=(0, 0))
+
+        self.assertEqual(without_origin.browser_resource_hints, set())
+        self.assertEqual(with_origin.browser_resource_hints, {(10, 0)})
+
+    def test_browser_hint_distance_is_configurable(self) -> None:
+        with TemporaryDirectory() as directory:
+            intel_path = Path(directory) / "browser-intel.json"
+            self._write_intel(intel_path, [[50, 0], [70, 0]])
+
+            default_memory = TacticMemory(mode=MODE_DEVELOP)
+            default_memory.refresh_browser_intel(intel_path, origin=(0, 0))
+
+            widened = TacticMemory(mode=MODE_DEVELOP)
+            widened.browser_hint_distance = 64
+            widened.refresh_browser_intel(intel_path, origin=(0, 0))
+
+        # 默认 32 格：两个坐标都在范围外
+        self.assertEqual(default_memory.browser_hint_distance, 32)
+        self.assertEqual(default_memory.browser_resource_hints, set())
+        # 放宽到 64 格：50 格的进来，70 格的仍被挡住
+        self.assertEqual(widened.browser_resource_hints, {(50, 0)})
+
+    def test_browser_hint_distance_zero_disables_hints(self) -> None:
+        with TemporaryDirectory() as directory:
+            intel_path = Path(directory) / "browser-intel.json"
+            self._write_intel(intel_path, [[4, 0]])
+            memory = TacticMemory(mode=MODE_DEVELOP)
+            memory.browser_hint_distance = 0
+            memory.refresh_browser_intel(intel_path, origin=(0, 0))
+
+        self.assertTrue(memory.browser_intel_online)
+        self.assertEqual(memory.browser_resource_hints, set())
+
+    def test_browser_hint_distance_read_from_control_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "browser_hint_distance": 48}),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            memory.load_control(control_path)
+
+        self.assertEqual(memory.browser_hint_distance, 48)
 
     def test_distant_browser_resource_hint_yields_to_local_search(self) -> None:
         with TemporaryDirectory() as directory:
@@ -8254,6 +8364,312 @@ class StuckHealPredictionTests(unittest.TestCase):
             self.assertFalse(
                 any("rally_advance" in item for item in summary.decisions)
             )
+
+
+class CompositionLadderTests(unittest.TestCase):
+    """develop 目标编制阶梯（20 人 12:4:4 → 30 人 18:6:6 → 不限）。"""
+
+    def test_split_population_totals_match_target(self) -> None:
+        self.assertEqual(_split_population(20, (12, 4, 4)), (12, 4, 4))
+        self.assertEqual(_split_population(30, (18, 6, 6)), (18, 6, 6))
+        # 除不尽时用最大余额法补齐，三项之和仍等于目标人口
+        for population, weights in (
+            (20, (5, 4, 6)),
+            (7, (1, 1, 1)),
+            (13, (3, 1, 2)),
+            (1, (12, 4, 4)),
+        ):
+            counts = _split_population(population, weights)
+            self.assertEqual(sum(counts), population, msg=f"{population}/{weights}")
+
+    def test_ladder_advances_with_population(self) -> None:
+        memory = TacticMemory()
+        self.assertEqual(memory.target_population, 20)
+        self.assertEqual(
+            (
+                memory.composition_workers,
+                memory.composition_vanguards,
+                memory.composition_rangers,
+            ),
+            (12, 4, 4),
+        )
+        for population in (0, 10, 19):
+            self.assertEqual(_effective_composition(memory, population), (12, 4, 4))
+            self.assertEqual(_effective_target_population(memory, population), 20)
+        for population in (20, 25, 29):
+            self.assertEqual(
+                _effective_composition(memory, population),
+                (
+                    COMPOSITION_STAGE2_WORKERS,
+                    COMPOSITION_STAGE2_VANGUARDS,
+                    COMPOSITION_STAGE2_RANGERS,
+                ),
+            )
+            self.assertEqual(
+                _effective_target_population(memory, population),
+                COMPOSITION_STAGE2_POPULATION,
+            )
+        # 两级都达成后取消人口目标，回落项目默认比例
+        for population in (30, 45):
+            self.assertIsNone(_effective_composition(memory, population))
+            self.assertEqual(_effective_target_population(memory, population), 0)
+            self.assertEqual(
+                _effective_growth_profile(memory, population),
+                CONTINUOUS_GROWTH_PROFILE,
+            )
+
+    def test_ladder_disabled_by_zero_and_outside_develop(self) -> None:
+        memory = TacticMemory()
+        memory.target_population = 0
+        self.assertIsNone(_effective_composition(memory, 5))
+        self.assertEqual(_effective_growth_profile(memory, 5), CONTINUOUS_GROWTH_PROFILE)
+
+        memory = TacticMemory()
+        memory.composition_workers = 0
+        memory.composition_vanguards = 0
+        memory.composition_rangers = 0
+        self.assertIsNone(_effective_composition(memory, 5))
+
+        for mode in (MODE_AGGRESS, MODE_BEACON, MODE_MIGRATE):
+            memory = TacticMemory()
+            memory.mode = mode
+            self.assertIsNone(_effective_composition(memory, 5))
+            self.assertEqual(_effective_target_population(memory, 5), 0)
+
+    def test_zero_weight_removes_unit_type_from_growth(self) -> None:
+        memory = TacticMemory()
+        memory.composition_rangers = 0
+        profile = _effective_growth_profile(memory, 5)
+        self.assertNotIn(UnitType.RANGER, {unit_type for unit_type, _ in profile})
+        self.assertIn(UnitType.WORKER, {unit_type for unit_type, _ in profile})
+
+    def test_develop_targets_follow_first_ladder_stage(self) -> None:
+        """12:4:4 的先锋目标 4 生效：3 先锋时补先锋，而不是按默认补到 3+1 之外。"""
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "composition_rangers": 4}),
+                encoding="utf-8",
+            )
+            units = tuple(
+                worker(_ladder_uuid(index), (6 + index, 0)) for index in range(4)
+            ) + (
+                vanguard((1, 0), VANGUARD_ID),
+                vanguard((-1, 0), VANGUARD_TWO_ID),
+                vanguard((0, 1), VANGUARD_THREE_ID),
+                ranger((2, 0), RANGER_ID),
+                ranger((-2, 0), RANGER_TWO_ID),
+                ranger((0, 2), RANGER_THREE_ID),
+                ranger((0, -2), _ladder_uuid(50)),
+            )
+            turn, _ = make_turn(own_core=core((0, 0)), units=units, resources=60)
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        # 先锋 3 < 目标 4 → 补先锋；游侠已达 4，不再抢在先锋之前
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
+
+    def _beacon_switch_roster(self):
+        """4 先锋 + 5 游侠：刚好越过自动抢信标的门槛。"""
+        return tuple(
+            worker(_ladder_uuid(index), (6 + index, 0)) for index in range(8)
+        ) + (
+            vanguard((3, 3), VANGUARD_ID),
+            vanguard((4, 3), VANGUARD_TWO_ID),
+            vanguard((5, 3), VANGUARD_THREE_ID),
+            vanguard((6, 3), VANGUARD_FOURTH_ID),
+            ranger((3, 4), RANGER_ID),
+            ranger((4, 4), RANGER_TWO_ID),
+            ranger((5, 4), RANGER_THREE_ID),
+            ranger((6, 4), RANGER_FOURTH_ID),
+            ranger((7, 4), _ladder_uuid(60)),
+        )
+
+    def test_active_ladder_postpones_beacon_expedition(self) -> None:
+        """阶梯生效期间不自动切 beacon，否则 develop 专属的阶梯与囤积会失效。"""
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=self._beacon_switch_roster(),
+            resources=21,
+        )
+        memory = TacticMemory()
+        SmartTactic(memory).choose_actions(turn)
+        self.assertEqual(memory.mode, MODE_DEVELOP)
+
+    def test_active_hoard_postpones_beacon_expedition(self) -> None:
+        """囤积在人口 30 才触发，那时阶梯已用尽，因此囤积也要能押后抢信标。"""
+        units = tuple(
+            worker(_ladder_uuid(index), (6 + index, 0)) for index in range(18)
+        ) + tuple(
+            vanguard((3, 3 + index), _ladder_uuid(100 + index)) for index in range(6)
+        ) + tuple(
+            ranger((-3, 3 + index), _ladder_uuid(200 + index)) for index in range(6)
+        )
+        turn, _ = make_turn(own_core=core((0, 0)), units=units, resources=40)
+        memory = TacticMemory()
+        # 人口 30 → 阶梯用尽；只有囤积开关能继续押后
+        self.assertEqual(_effective_target_population(memory, len(units)), 0)
+        memory.hoard_stage2 = True
+        SmartTactic(memory).choose_actions(turn)
+        self.assertEqual(memory.mode, MODE_DEVELOP)
+
+
+class ResourceHoardTests(unittest.TestCase):
+    """develop 资源囤积（人口 20 攒 95 / 人口 30 攒 150）。"""
+
+    def _develop_roster(self, workers: int, vanguards: int, rangers: int):
+        units = tuple(
+            worker(_ladder_uuid(index), (6 + index, 0)) for index in range(workers)
+        )
+        units += tuple(
+            vanguard((3, 3 + index), _ladder_uuid(100 + index))
+            for index in range(vanguards)
+        )
+        units += tuple(
+            ranger((-3, 3 + index), _ladder_uuid(200 + index))
+            for index in range(rangers)
+        )
+        return units
+
+    def _spawn_for(
+        self,
+        *,
+        resources: int,
+        control: dict,
+        workers: int = 12,
+        vanguards: int = 4,
+        rangers: int = 4,
+        enemies: tuple = (),
+    ):
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(json.dumps(control), encoding="utf-8")
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=self._develop_roster(workers, vanguards, rangers),
+                resources=resources,
+                enemies=enemies,
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+        return turn.plan.core_action
+
+    def test_target_only_applies_to_develop(self) -> None:
+        for mode, expected in (
+            (MODE_DEVELOP, HOARD_STAGE1_RESOURCE_TARGET),
+            (MODE_AGGRESS, 0),
+            (MODE_BEACON, 0),
+        ):
+            memory = TacticMemory()
+            memory.mode = mode
+            memory.hoard_stage1 = True
+            self.assertEqual(
+                _hoard_resource_target(memory, HOARD_STAGE1_POPULATION),
+                expected,
+                msg=mode,
+            )
+
+    def test_target_requires_population_threshold(self) -> None:
+        memory = TacticMemory()
+        memory.hoard_stage1 = True
+        self.assertEqual(_hoard_resource_target(memory, HOARD_STAGE1_POPULATION - 1), 0)
+        self.assertEqual(
+            _hoard_resource_target(memory, HOARD_STAGE1_POPULATION),
+            HOARD_STAGE1_RESOURCE_TARGET,
+        )
+        # 只开第一档时，人口 30 之后仍然维持 95 的水位
+        self.assertEqual(
+            _hoard_resource_target(memory, HOARD_STAGE2_POPULATION),
+            HOARD_STAGE1_RESOURCE_TARGET,
+        )
+        memory.hoard_stage2 = True
+        self.assertEqual(
+            _hoard_resource_target(memory, HOARD_STAGE2_POPULATION),
+            HOARD_STAGE2_RESOURCE_TARGET,
+        )
+
+    def test_blocks_spawn_below_water_line(self) -> None:
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET - 1,
+            control={"mode": "develop", "hoard_stage1": True},
+        )
+        self.assertNotIsInstance(action, SpawnAction)
+
+    def test_releases_spawn_at_water_line(self) -> None:
+        """关键回归：水位是解锁阈值而非产兵后下限。
+
+        人口 20 的仓库容量只有 100，若要求产兵后仍不低于 95，最便宜的工人（7）也
+        买不起，人口会永久卡死。这里断言攒到水位就能产出兵。
+        """
+
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET,
+            control={"mode": "develop", "hoard_stage1": True},
+        )
+        self.assertIsInstance(action, SpawnAction)
+
+    def test_disabled_switch_keeps_spawning(self) -> None:
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET - 1,
+            control={"mode": "develop", "hoard_stage1": False},
+        )
+        self.assertIsInstance(action, SpawnAction)
+
+    def test_nearby_enemy_overrides_hoard(self) -> None:
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET - 1,
+            control={"mode": "develop", "hoard_stage1": True},
+            enemies=(enemy_ranger((3, 0)),),
+        )
+        self.assertIsInstance(action, SpawnAction)
+
+    def test_home_guard_shortfall_overrides_hoard(self) -> None:
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET - 1,
+            control={"mode": "develop", "hoard_stage1": True},
+            workers=18,
+            vanguards=1,
+            rangers=1,
+        )
+        self.assertIsInstance(action, SpawnAction)
+
+    def test_worker_floor_overrides_hoard(self) -> None:
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET - 1,
+            control={"mode": "develop", "hoard_stage1": True},
+            workers=2,
+            vanguards=9,
+            rangers=9,
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.WORKER)
+
+    def test_stage_two_blocks_until_higher_water_line(self) -> None:
+        blocked = self._spawn_for(
+            resources=HOARD_STAGE2_RESOURCE_TARGET - 1,
+            control={"mode": "develop", "hoard_stage1": True, "hoard_stage2": True},
+            workers=18,
+            vanguards=6,
+            rangers=6,
+        )
+        self.assertNotIsInstance(blocked, SpawnAction)
+        released = self._spawn_for(
+            resources=HOARD_STAGE2_RESOURCE_TARGET,
+            control={"mode": "develop", "hoard_stage1": True, "hoard_stage2": True},
+            workers=18,
+            vanguards=6,
+            rangers=6,
+        )
+        self.assertIsInstance(released, SpawnAction)
+
+    def test_aggress_mode_ignores_hoard(self) -> None:
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET - 1,
+            control={"mode": "aggress", "hoard_stage1": True, "hoard_stage2": True},
+            workers=12,
+            vanguards=4,
+            rangers=4,
+        )
+        self.assertIsInstance(action, SpawnAction)
 
 
 if __name__ == "__main__":

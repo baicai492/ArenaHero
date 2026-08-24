@@ -7,7 +7,28 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.request import HTTPError, Request, urlopen
 
-from arena_hero_route_overlay_server import create_server
+from arena_hero_route_overlay_server import (
+    CONTROL_FLAG_DEFAULTS,
+    CONTROL_NUMBER_DEFAULTS,
+    create_server,
+)
+
+
+def expected_control(**overrides: object) -> dict[str, object]:
+    """控制文件的完整默认快照，测试只声明与默认值不同的字段。
+
+    新增控制字段时只需更新 CONTROL_*_DEFAULTS，不必逐个修改断言里的字典字面量。
+    """
+
+    payload: dict[str, object] = {
+        "mode": "develop",
+        "recall": False,
+        "rally_point": None,
+        **CONTROL_FLAG_DEFAULTS,
+        **CONTROL_NUMBER_DEFAULTS,
+    }
+    payload.update(overrides)
+    return payload
 
 
 class RouteOverlayServerTests(unittest.TestCase):
@@ -194,22 +215,7 @@ class RouteOverlayServerTests(unittest.TestCase):
             try:
                 with urlopen(f"{base}/control", timeout=2) as response:
                     default = json.load(response)
-                self.assertEqual(
-                    default,
-                    {
-                        "mode": "develop",
-                        "recall": False,
-                        "raid_enabled": False,
-                        "raid_recall": False,
-                        "raid_vanguards": 1,
-                        "raid_rangers": 2,
-                        "beacon_target_distance": 0,
-                        "rally_point": None,
-                        "aggress_vanguards": 0,
-                        "aggress_rangers": 0,
-            "ally_support_enabled": False,
-                    },
-                )
+                self.assertEqual(default, expected_control())
 
                 request = Request(
                     f"{base}/control",
@@ -220,55 +226,17 @@ class RouteOverlayServerTests(unittest.TestCase):
                 with urlopen(request, timeout=2) as response:
                     posted = json.load(response)
                 self.assertEqual(
-                    posted,
-                    {
-                        "mode": "aggress",
-                        "recall": True,
-                        "raid_enabled": False,
-                        "raid_recall": False,
-                        "raid_vanguards": 1,
-                        "raid_rangers": 2,
-                        "beacon_target_distance": 0,
-                        "rally_point": None,
-                        "aggress_vanguards": 0,
-                        "aggress_rangers": 0,
-            "ally_support_enabled": False,
-                    },
+                    posted, expected_control(mode="aggress", recall=True)
                 )
 
                 with urlopen(f"{base}/control", timeout=2) as response:
                     after = json.load(response)
                 self.assertEqual(
-                    after,
-                    {
-                        "mode": "aggress",
-                        "recall": True,
-                        "raid_enabled": False,
-                        "raid_recall": False,
-                        "raid_vanguards": 1,
-                        "raid_rangers": 2,
-                        "beacon_target_distance": 0,
-                        "rally_point": None,
-                        "aggress_vanguards": 0,
-                        "aggress_rangers": 0,
-            "ally_support_enabled": False,
-                    },
+                    after, expected_control(mode="aggress", recall=True)
                 )
                 self.assertEqual(
                     json.loads(control_path.read_text(encoding="utf-8")),
-                    {
-                        "mode": "aggress",
-                        "recall": True,
-                        "raid_enabled": False,
-                        "raid_recall": False,
-                        "raid_vanguards": 1,
-                        "raid_rangers": 2,
-                        "beacon_target_distance": 0,
-                        "rally_point": None,
-                        "aggress_vanguards": 0,
-                        "aggress_rangers": 0,
-            "ally_support_enabled": False,
-                    },
+                    expected_control(mode="aggress", recall=True),
                 )
             finally:
                 server.shutdown()
@@ -338,19 +306,12 @@ class RouteOverlayServerTests(unittest.TestCase):
 
         self.assertEqual(
             posted,
-            {
-                "mode": "develop",
-                "recall": False,
-                "raid_enabled": True,
-                "raid_recall": True,
-                "raid_vanguards": 3,
-                "raid_rangers": 4,
-                "beacon_target_distance": 0,
-                "rally_point": None,
-                "aggress_vanguards": 0,
-                "aggress_rangers": 0,
-            "ally_support_enabled": False,
-            },
+            expected_control(
+                raid_enabled=True,
+                raid_recall=True,
+                raid_vanguards=3,
+                raid_rangers=4,
+            ),
         )
 
     def test_partial_control_update_preserves_existing_settings(self) -> None:
@@ -397,19 +358,14 @@ class RouteOverlayServerTests(unittest.TestCase):
 
         self.assertEqual(
             posted,
-            {
-                "mode": "aggress",
-                "recall": True,
-                "raid_enabled": False,
-                "raid_recall": False,
-                "raid_vanguards": 1,
-                "raid_rangers": 2,
-                "beacon_target_distance": 50,
-                "rally_point": [-20, 80],
-                "aggress_vanguards": 6,
-                "aggress_rangers": 7,
-            "ally_support_enabled": False,
-            },
+            expected_control(
+                mode="aggress",
+                recall=True,
+                beacon_target_distance=50,
+                rally_point=[-20, 80],
+                aggress_vanguards=6,
+                aggress_rangers=7,
+            ),
         )
 
     def test_control_rejects_web_page_origin(self) -> None:
@@ -510,22 +466,7 @@ class RouteOverlayServerTests(unittest.TestCase):
                 )
                 with urlopen(request, timeout=2) as response:
                     posted = json.load(response)
-                self.assertEqual(
-                    posted,
-                    {
-                        "mode": "beacon",
-                        "recall": False,
-                        "raid_enabled": False,
-                        "raid_recall": False,
-                        "raid_vanguards": 1,
-                        "raid_rangers": 2,
-                        "beacon_target_distance": 0,
-                        "rally_point": None,
-                        "aggress_vanguards": 0,
-                        "aggress_rangers": 0,
-            "ally_support_enabled": False,
-                    },
-                )
+                self.assertEqual(posted, expected_control(mode="beacon"))
             finally:
                 server.shutdown()
                 server.server_close()

@@ -94,7 +94,12 @@
     if (typeof payload.recall === "boolean") {
       update.recall = payload.recall;
     }
-    for (const key of ["raid_enabled", "raid_recall"]) {
+    for (const key of [
+      "raid_enabled",
+      "raid_recall",
+      "hoard_stage1",
+      "hoard_stage2",
+    ]) {
       if (typeof payload[key] === "boolean") {
         update[key] = payload[key];
       }
@@ -119,7 +124,15 @@
         update[key] = payload[key];
       }
     }
-    for (const key of ["raid_vanguards", "raid_rangers"]) {
+    for (const key of [
+      "raid_vanguards",
+      "raid_rangers",
+      "target_population",
+      "composition_workers",
+      "composition_vanguards",
+      "composition_rangers",
+      "browser_hint_distance",
+    ]) {
       if (typeof payload[key] === "number" && Number.isFinite(payload[key])) {
         update[key] = payload[key];
       }

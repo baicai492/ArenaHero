@@ -26,6 +26,7 @@ from arena_hero import (
 
 from arena_hero_route_overlay_server import create_server
 from arena_hero_strategy import ROUTES_FILENAME, SmartTactic, TacticMemory
+from test_arena_hero_route_overlay_server import expected_control
 
 CORE_ID = UUID("00000000-0000-4000-8000-000000000100")
 WORKER_A = UUID("00000000-0000-4000-8000-000000000001")
@@ -142,22 +143,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(routes_payload["tick"], 12)
             self.assertEqual(stats_payload["mode"], "aggress")
             self.assertEqual(stats_payload["resources"], 25)
-            self.assertEqual(
-                control_payload,
-                {
-                    "mode": "aggress",
-                    "recall": False,
-                    "raid_enabled": False,
-                    "raid_recall": False,
-                    "raid_vanguards": 1,
-                    "raid_rangers": 2,
-                    "beacon_target_distance": 0,
-                    "rally_point": None,
-                    "aggress_vanguards": 0,
-                    "aggress_rangers": 0,
-            "ally_support_enabled": False,
-                },
-            )
+            self.assertEqual(control_payload, expected_control(mode="aggress"))
 
 
 if __name__ == "__main__":

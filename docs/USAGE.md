@@ -217,6 +217,16 @@ python arena_hero_route_overlay_server.py --port 8765
 | `auto_migrate` | boolean | 候选格通过防守面检查后自动进入迁移模式 |
 | `aggress_vanguards` | non-negative integer | 指定侵略先锋数量；0 使用自动分配 |
 | `aggress_rangers` | non-negative integer | 指定侵略游侠数量；0 使用自动分配 |
+| `ally_support_enabled` | boolean | 盟友 Core 被攻击时派兵支援 |
+| `hoard_stage1` | boolean | 发育模式人口达 20 后先把资源攒到 95 再产兵 |
+| `hoard_stage2` | boolean | 发育模式人口达 30 后先把资源攒到 150 再产兵 |
+| `target_population` | non-negative integer | 发育编制阶梯第一级的目标人口，默认 20；0 关闭阶梯 |
+| `composition_workers` | non-negative integer | 阶梯第一级的工人配比，默认 12 |
+| `composition_vanguards` | non-negative integer | 阶梯第一级的先锋配比，默认 4 |
+| `composition_rangers` | non-negative integer | 阶梯第一级的游侠配比，默认 4 |
+| `browser_hint_distance` | non-negative integer | 浏览器水晶提示的搜索半径（格），默认 32；0 关闭提示。提示来自客户端已探索缓存里标记 `RESOURCE` 的格，含工人已离开视野的水晶；实测近处水晶多在 40~70 格，默认 32 常常用不上 |
+
+后四个字段与两个囤积开关只影响 `develop` 模式，详见 [STRATEGY.md](STRATEGY.md) 的「`develop` 目标编制阶梯与资源囤积」。注意阶梯或囤积生效期间会押后自动抢信标。
 
 控制文件在每个 Turn 开始时按修改时间热读取。浏览器 Manual 动作仍然按服务器规则优先于 Agent 对同一对象的动作。
 

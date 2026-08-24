@@ -45,3 +45,6 @@ Thumbs.db
 # Personal Codex CLI helpers
 codex.ps1
 retry-codex.ps1
+
+# Browser resource diagnosis captures (contain live session ids)
+tools/结果*.txt

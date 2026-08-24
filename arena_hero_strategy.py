@@ -265,6 +265,28 @@ CONTINUOUS_GROWTH_PROFILE = (
 # temporarily unaffordable. The bound prevents cheap Workers from consuming
 # every deposit while the force is trying to save for combat units.
 CONTINUOUS_GROWTH_PRESSURE_SLACK = 0.20
+# 2026-08-24 用户战术：跨过人口涨价档位后先把仓库攒到接近容量上限，再恢复产兵。
+# 引擎规则（arena_hero.rules）：仓库容量 = max(10, 人口 × 5)，单位价格在人口
+# 20/25/30 各涨一档（× 1.3^n）。人口 20 时容量 100、爆兵性价比开始骤降，人口 30
+# 时容量 150、价格已是基础价的 2.2 倍。高库存换来随时治疗、修盾与爆发补兵的能力。
+# 目标值贴着容量上限：95 给人口 20 留 5 格缓冲，150 是人口 30 的满仓。
+# 两档默认关闭，由控制文件的 hoard_stage1/hoard_stage2 开关分别启用。
+HOARD_STAGE1_POPULATION = 20
+HOARD_STAGE1_RESOURCE_TARGET = 95
+HOARD_STAGE2_POPULATION = 30
+HOARD_STAGE2_RESOURCE_TARGET = 150
+# 2026-08-24 用户战术：目标编制按人口自动递进的三级阶梯。第一级来自控制文件
+# （默认 20 人 12:4:4，总和正好卡在人口 20 的涨价档前），达成后自动升到第二级
+# 30 人 18:6:6，两级都达成后取消人口目标、回落项目默认 5:4:6 连续增长。
+# 每一级配合下面的资源囤积开关：产兵后资源不得跌破该级水位（95 / 150）。
+DEFAULT_TARGET_POPULATION = 20
+DEFAULT_COMPOSITION_WORKERS = 12
+DEFAULT_COMPOSITION_VANGUARDS = 4
+DEFAULT_COMPOSITION_RANGERS = 4
+COMPOSITION_STAGE2_POPULATION = 30
+COMPOSITION_STAGE2_WORKERS = 18
+COMPOSITION_STAGE2_VANGUARDS = 6
+COMPOSITION_STAGE2_RANGERS = 6
 # Once the Beacon home screen has five Vanguards, preserve the next affordable
 # resource window for the cheaper pre-population-20 Ranger instead of filling
 # a sixth/eighth Vanguard first.
@@ -434,7 +456,13 @@ BROWSER_INTEL_MAX_AGE_SECONDS = 12
 BROWSER_RESOURCE_REQUIRE_QUOTA_PLAUSIBILITY = True
 # 浏览器地图只作为近处低可信提示；远处坐标必须由游戏视野重新确认，
 # 否则一次旧快照会把所有工人拖离采集区。
-BROWSER_RESOURCE_HINT_MAX_DISTANCE = 32
+# 2026-08-24 改为控制文件 browser_hint_distance 的默认值，可在叠加层面板调整。
+# 距离过滤在配额检查之前执行（见 refresh_browser_intel）：浏览器读的是游戏客户端
+# React 状态，其中保留了所有浏览过区域的地形数据，实测一次快照 790 个坐标里 97%
+# 是几百到四千格外的成片地形误报。若先做配额检查，这些远处误报会让整批数据被
+# 否决，连近处真实的水晶一起丢掉。
+DEFAULT_BROWSER_HINT_DISTANCE = 32
+BROWSER_RESOURCE_HINT_MAX_DISTANCE = DEFAULT_BROWSER_HINT_DISTANCE
 BROWSER_RESOURCE_SCOUT_LIMIT = 1
 CORE_LOGISTICS_CORRIDOR_LENGTH = 3
 MIGRATION_SITE_RADIUS = 3
@@ -595,6 +623,127 @@ class DecisionSummary:
     decisions: tuple[str, ...]
 
 
+def _hoard_resource_target(memory: "TacticMemory", population: int) -> int:
+    """返回当前人口下的资源囤积目标；0 表示不囤积。
+
+    仅 develop 发育模式生效。两档开关互相独立，同时命中时取较高目标，因此只开
+    第一档也能在人口 30 之后继续维持 95 的水位。
+    """
+
+    if memory.mode != MODE_DEVELOP:
+        return 0
+    target = 0
+    if memory.hoard_stage1 and population >= HOARD_STAGE1_POPULATION:
+        target = HOARD_STAGE1_RESOURCE_TARGET
+    if memory.hoard_stage2 and population >= HOARD_STAGE2_POPULATION:
+        target = max(target, HOARD_STAGE2_RESOURCE_TARGET)
+    return target
+
+
+def _composition_ladder_enabled(memory: "TacticMemory") -> bool:
+    """自定义编制阶梯是否启用：仅 develop 模式，且目标人口与配比都非 0。"""
+
+    return (
+        memory.mode == MODE_DEVELOP
+        and memory.target_population > 0
+        and (
+            memory.composition_workers
+            + memory.composition_vanguards
+            + memory.composition_rangers
+        )
+        > 0
+    )
+
+
+def _effective_target_population(memory: "TacticMemory", population: int) -> int:
+    """返回当前生效的目标人口；0 表示已进入不限人口的连续增长。"""
+
+    if not _composition_ladder_enabled(memory):
+        return 0
+    if population < memory.target_population:
+        return memory.target_population
+    if population < COMPOSITION_STAGE2_POPULATION:
+        return COMPOSITION_STAGE2_POPULATION
+    return 0
+
+
+def _effective_composition(
+    memory: "TacticMemory", population: int
+) -> tuple[int, int, int] | None:
+    """返回当前人口所处阶梯的 (工人, 先锋, 游侠) 目标编制。
+
+    阶梯第一级由控制文件配置（默认 20 人 12:4:4），达成后自动升到第二级 30 人
+    18:6:6；两级都达成后返回 None，由调用方回落各模式的项目默认编制。目标人口
+    或配比合计设为 0，以及非 develop 模式，同样返回 None。
+    """
+
+    if not _composition_ladder_enabled(memory):
+        return None
+    if population < memory.target_population:
+        return _split_population(
+            memory.target_population,
+            (
+                memory.composition_workers,
+                memory.composition_vanguards,
+                memory.composition_rangers,
+            ),
+        )
+    if population < COMPOSITION_STAGE2_POPULATION:
+        return (
+            COMPOSITION_STAGE2_WORKERS,
+            COMPOSITION_STAGE2_VANGUARDS,
+            COMPOSITION_STAGE2_RANGERS,
+        )
+    return None
+
+
+def _split_population(
+    population: int, weights: tuple[int, int, int]
+) -> tuple[int, int, int]:
+    """把目标人口按配比拆成三个兵种目标。
+
+    最大余额法：先按比例向下取整，再把余下人口分给小数部分最大的兵种，保证三个
+    目标之和正好等于设定人口，避免整除误差让编制永远差一个单位。
+    """
+
+    total_weight = sum(weights)
+    scaled = [population * weight for weight in weights]
+    counts = [value // total_weight for value in scaled]
+    shortfall = population - sum(counts)
+    if shortfall > 0:
+        for index in sorted(
+            range(len(weights)),
+            key=lambda position: (-(scaled[position] % total_weight), position),
+        )[:shortfall]:
+            counts[index] += 1
+    return (counts[0], counts[1], counts[2])
+
+
+def _effective_growth_profile(
+    memory: "TacticMemory", population: int
+) -> tuple[tuple[UnitType, int], ...]:
+    """返回连续增长的 (兵种, 权重) 序列；阶梯用尽后沿用默认 5:4:6。
+
+    权重顺序与 CONTINUOUS_GROWTH_PROFILE 保持一致，让同压力时的稳定排序继续
+    偏向战斗兵；权重 0 的兵种被排除，因此 12:4:0 表示不再产游侠。
+    """
+
+    composition = _effective_composition(memory, population)
+    if composition is None:
+        return CONTINUOUS_GROWTH_PROFILE
+    workers, vanguards, rangers = composition
+    configured = tuple(
+        (unit_type, weight)
+        for unit_type, weight in (
+            (UnitType.RANGER, rangers),
+            (UnitType.VANGUARD, vanguards),
+            (UnitType.WORKER, workers),
+        )
+        if weight > 0
+    )
+    return configured or CONTINUOUS_GROWTH_PROFILE
+
+
 @dataclass
 class TacticMemory:
     known_obstacles: set[Position] = field(default_factory=set)
@@ -634,6 +783,16 @@ class TacticMemory:
     auto_migrate: bool = False
     # 2026-08-12 共同抗敌开关（control 配置）：盟友 Core 被攻击时派兵支援。
     ally_support_enabled: bool = False
+    # 2026-08-24 资源囤积开关（control 配置）：跨过人口档位后先攒满仓库再产兵。
+    hoard_stage1: bool = False
+    hoard_stage2: bool = False
+    # 2026-08-24 自定义目标编制与增长配比（control 配置），0 表示用项目默认。
+    target_population: int = DEFAULT_TARGET_POPULATION
+    composition_workers: int = DEFAULT_COMPOSITION_WORKERS
+    composition_vanguards: int = DEFAULT_COMPOSITION_VANGUARDS
+    composition_rangers: int = DEFAULT_COMPOSITION_RANGERS
+    # 2026-08-24 浏览器水晶提示的搜索半径（control 配置），0 表示不使用提示。
+    browser_hint_distance: int = DEFAULT_BROWSER_HINT_DISTANCE
     unit_label_mapping: dict[str, str] = field(default_factory=dict)
     last_events: list[dict] = field(default_factory=list)
     unit_positions_for_overlay: dict[str, Position] = field(default_factory=dict)
@@ -1886,6 +2045,21 @@ class TacticMemory:
             self.ally_support_enabled = bool(
                 data.get("ally_support_enabled", self.ally_support_enabled)
             )
+            # 2026-08-24 资源囤积开关与自定义编制。
+            self.hoard_stage1 = bool(data.get("hoard_stage1", self.hoard_stage1))
+            self.hoard_stage2 = bool(data.get("hoard_stage2", self.hoard_stage2))
+            for key in (
+                "target_population",
+                "composition_workers",
+                "composition_vanguards",
+                "composition_rangers",
+                "browser_hint_distance",
+            ):
+                raw_value = data.get(key)
+                if isinstance(raw_value, (int, float)) and not isinstance(
+                    raw_value, bool
+                ):
+                    setattr(self, key, max(0, int(raw_value)))
             # 2026-08-12 坐标迁移：手动指定迁移目标（mode 同时设为 migrate）。
             raw_manual_target = data.get("migration_target")
             if (
@@ -2012,8 +2186,20 @@ class TacticMemory:
                 self.recovery_targets.append(position)
                 active_targets.add(position)
 
-    def refresh_browser_intel(self, path: Path | None = None) -> None:
-        """Load expiring browser-map coordinates as low-confidence hints."""
+    def refresh_browser_intel(
+        self,
+        path: Path | None = None,
+        origin: Position | None = None,
+    ) -> None:
+        """Load expiring browser-map coordinates as low-confidence hints.
+
+        origin 给出 Core 当前位置时，超出 browser_hint_distance 的坐标在配额检查
+        之前就被剔除。浏览器读的是游戏客户端 React 状态，其中保留了所有浏览过
+        区域的地形数据；实测一次快照 790 个坐标里 97% 是几百到四千格外的成片地形
+        误报。先做距离过滤，远处误报就不会让整批数据被配额检查否决，近处真实的
+        水晶才有机会进入提示集。
+        """
+
         self.browser_resource_hints.clear()
         self.browser_intel_captured_at = None
         self.browser_intel_age_seconds = 0
@@ -2040,6 +2226,9 @@ class TacticMemory:
             raw_resources = data.get("resources", [])
             if not isinstance(raw_resources, list):
                 return
+            max_distance = self.browser_hint_distance
+            if max_distance <= 0:
+                return
             candidate_hints: set[Position] = set()
             for value in raw_resources[:4096]:
                 if (
@@ -2050,7 +2239,13 @@ class TacticMemory:
                         for item in value
                     )
                 ):
-                    candidate_hints.add((int(value[0]), int(value[1])))
+                    position = (int(value[0]), int(value[1]))
+                    if (
+                        origin is not None
+                        and _distance(origin, position) > max_distance
+                    ):
+                        continue
+                    candidate_hints.add(position)
             if BROWSER_RESOURCE_REQUIRE_QUOTA_PLAUSIBILITY:
                 per_chunk = Counter(_chunk_of(position) for position in candidate_hints)
                 if any(
@@ -2073,6 +2268,12 @@ class TacticMemory:
                 max(0, turn.tick - self.first_observed_tick + 1)
                 if self.first_observed_tick > 0
                 else 0
+            )
+            # 阶梯用尽时回落项目默认编制，让面板 tooltip 显示实际生效的目标。
+            effective_composition = _effective_composition(self, len(turn.units)) or (
+                DEVELOP_TARGET_WORKERS,
+                RAID_HOME_RESERVE_VANGUARDS + DEVELOP_BEACON_EXPEDITION_VANGUARDS,
+                RAID_HOME_RESERVE_RANGERS + DEVELOP_BEACON_EXPEDITION_RANGERS,
             )
             payload = {
                 "tick": turn.tick,
@@ -2112,6 +2313,22 @@ class TacticMemory:
                 "migration_site_checked": self.migration_site_checked,
                 "migration_site_score": self.migration_site_score,
                 "beacon_target_distance": self.beacon_target_distance,
+                "hoard_stage1": self.hoard_stage1,
+                "hoard_stage2": self.hoard_stage2,
+                "hoard_target": _hoard_resource_target(self, len(turn.units)),
+                "target_population": self.target_population,
+                "composition_workers": self.composition_workers,
+                "composition_vanguards": self.composition_vanguards,
+                "composition_rangers": self.composition_rangers,
+                "browser_hint_distance": self.browser_hint_distance,
+                "effective_target_population": _effective_target_population(
+                    self, len(turn.units)
+                ),
+                # 拆成三个标量而不是一个列表：overlay server 的 _normalize_stats
+                # 只认 bool/int/str，列表类型会被无条件替换成默认值。
+                "effective_workers": effective_composition[0],
+                "effective_vanguards": effective_composition[1],
+                "effective_rangers": effective_composition[2],
                 "resources": turn.resources,
                 "capacity": turn.resource_capacity,
                 "population": len(turn.units),
@@ -2956,7 +3173,9 @@ class SmartTactic:
             if isinstance(enemy, CoreView) and self.allies.is_ally_core(enemy)
         }
         self.memory.refresh_recovery_target_hints()
-        self.memory.refresh_browser_intel()
+        self.memory.refresh_browser_intel(
+            origin=turn.core.position if turn.core is not None else None
+        )
         self.memory.observe(turn)
         self._maybe_activate_post_recall_sweep(turn)
         self._maybe_activate_beacon_expedition(turn)
@@ -4695,14 +4914,16 @@ class SmartTactic:
         )
 
         if self.memory.mode in {MODE_DEVELOP, MODE_AGGRESS} and not full_capacity:
+            # refresh_browser_intel 已按同一半径预过滤，这里再兜一次：控制文件热改
+            # 半径后，本 Tick 的提示集可能还是上一个半径加载的。
+            browser_hint_distance = self.memory.browser_hint_distance
             browser_targets = {
                 position
                 for position in self.memory.browser_resource_hints
                 if position not in turn.resource_cells
                 and position not in self.memory.resource_last_seen
                 and position not in reserved_targets
-                and _distance(turn.core.position, position)
-                <= BROWSER_RESOURCE_HINT_MAX_DISTANCE
+                and _distance(turn.core.position, position) <= browser_hint_distance
                 and not _currently_visible(turn, position, self.memory.known_obstacles)
             }
             # 远程提示只派一个试探工人，其余工人保持本地搜索和采集编队。
@@ -6171,6 +6392,16 @@ class SmartTactic:
                 <= CORE_EMERGENCY_THREAT_RADIUS
                 for enemy in turn.visible_enemies
             )
+        ):
+            return
+        # 2026-08-24 编制阶梯或资源囤积生效期间押后抢信标。第二级目标 6 游侠会越过
+        # 这里的 5 名门槛，一旦切到 beacon，develop 专属的阶梯与囤积就全部失效，
+        # 第二级（30 人 / 攒 150）永远无法执行。囤积开关同样要押后：它在人口 30
+        # 之后才触发，而那时阶梯已经用尽，只看阶梯会让第二档囤积同样落空。
+        # 想恢复自动抢信标：关掉两个囤积开关，并把 target_population 设为 0。
+        if (
+            _effective_target_population(self.memory, len(turn.units)) > 0
+            or _hoard_resource_target(self.memory, len(turn.units)) > 0
         ):
             return
         required_vanguards = (
@@ -10612,6 +10843,25 @@ class SmartTactic:
         shield_cap = 10 if owns_beacon else 5
         reserve = 2 if near_threat or core.shield < shield_cap else 0
         budget = projected_resources - reserve
+        # 2026-08-24 资源囤积（仅 develop）：水位是产兵的解锁阈值，不是产兵后的下限。
+        # 仓库容量 = max(10, 人口 × 5)，人口 20 只有 100、人口 30 只有 150，若要求
+        # 产兵后仍不跌破 95 / 150，则连一个工人都买不起，人口会永久卡死。因此改为
+        # 攒到水位才放行一次产兵，花掉后重新攒回水位，常态维持接近满仓的库存。
+        # 四类逆风情况破例放行——攒资源是顺风局的优化，逆风时高库存只会变成敌方
+        # 斩首的战利品（摧毁 Core 会转移其库存资源）。
+        hoard_target = _hoard_resource_target(self.memory, current_population)
+        hoard_block = (
+            hoard_target > 0
+            and projected_resources < hoard_target
+            and not (
+                near_threat
+                or recovery_active
+                or home_vanguard_shortfall > 0
+                or home_ranger_shortfall > 0
+                or combat_shortfall > 0
+                or workers < AGGRESS_BASE_WORKERS
+            )
+        )
         mode = self.memory.mode
         recall = self.memory.recall
         known_core_target = (
@@ -10636,7 +10886,17 @@ class SmartTactic:
             )
         )
 
-        def continuous_growth_spawn() -> UnitType | None:
+        def continuous_growth_spawn(
+            growth_profile: tuple[tuple[UnitType, int], ...] = (
+                CONTINUOUS_GROWTH_PROFILE
+            ),
+        ) -> UnitType | None:
+            """按归一化比压挑下一个兵种。
+
+            默认使用项目的 5:4:6。只有 develop 模式会传入编制阶梯的配比——召回与
+            灾后重建是防守状态，套用偏经济的自定义配比会挤掉急需的战斗兵。
+            """
+
             counts = {
                 UnitType.WORKER: workers,
                 UnitType.VANGUARD: vanguards,
@@ -10649,9 +10909,11 @@ class SmartTactic:
             }
             profile = tuple(
                 (unit_type, weight)
-                for unit_type, weight in CONTINUOUS_GROWTH_PROFILE
+                for unit_type, weight in growth_profile
                 if not near_threat or unit_type is not UnitType.WORKER
             )
+            if not profile:
+                return None
             ranked_profile = sorted(
                 profile,
                 key=lambda item: counts[item[0]] / item[1],
@@ -10711,6 +10973,9 @@ class SmartTactic:
             return continuous_growth_spawn()
 
         if mode == MODE_DEVELOP:
+            develop_growth_profile = _effective_growth_profile(
+                self.memory, current_population
+            )
             if workers < 4 and budget >= worker_cost:
                 return UnitType.WORKER
             if vanguards < 1 and budget >= vanguard_cost:
@@ -10733,33 +10998,42 @@ class SmartTactic:
             ):
                 return UnitType.VANGUARD
             if near_threat:
-                return continuous_growth_spawn()
-            if (
-                vanguards
-                < RAID_HOME_RESERVE_VANGUARDS
+                return continuous_growth_spawn(develop_growth_profile)
+            # 资源囤积：开局底线（4 工 + 1 先 + 1 游）与遇袭响应都已让过，此处起
+            # 才是可以延后的扩张，攒到水位前不产兵。
+            if hoard_block:
+                return None
+            # 2026-08-24 目标编制阶梯（默认 20 人 12:4:4 → 30 人 18:6:6 → 不限）。
+            # 阶梯用尽后 composition 为 None，回落项目默认的 3+1 先锋 / 3+2 游侠 /
+            # 12 工人（即 12:4:5 = 21 人）。每级内部顺序与原策略一致：先锋 → 游侠
+            # → 工人。第一级只比原编制少 1 名游侠，让总数正好卡在涨价档前。
+            composition = _effective_composition(self.memory, current_population)
+            vanguard_target = (
+                composition[1]
+                if composition is not None
+                else RAID_HOME_RESERVE_VANGUARDS
                 + DEVELOP_BEACON_EXPEDITION_VANGUARDS
-                and budget >= vanguard_cost
-            ):
+            )
+            ranger_target = (
+                composition[2]
+                if composition is not None
+                else RAID_HOME_RESERVE_RANGERS + DEVELOP_BEACON_EXPEDITION_RANGERS
+            )
+            worker_target = (
+                composition[0] if composition is not None else DEVELOP_TARGET_WORKERS
+            )
+            if vanguards < vanguard_target and budget >= vanguard_cost:
                 return UnitType.VANGUARD
-            if (
-                rangers
-                < RAID_HOME_RESERVE_RANGERS
-                + DEVELOP_BEACON_EXPEDITION_RANGERS
-                and budget >= ranger_cost
-            ):
+            if rangers < ranger_target and budget >= ranger_cost:
                 return UnitType.RANGER
             if (
-                workers < DEVELOP_TARGET_WORKERS
+                workers < worker_target
                 and budget >= worker_cost
                 and projected_resources - worker_cost
                 >= DEFENSE_REPLACEMENT_RESERVE
             ):
                 return UnitType.WORKER
-            if rangers < DEVELOP_TARGET_RANGERS and budget >= ranger_cost:
-                return UnitType.RANGER
-            if vanguards < DEVELOP_TARGET_VANGUARDS and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            return continuous_growth_spawn()
+            return continuous_growth_spawn(develop_growth_profile)
 
         if mode == MODE_AGGRESS:
             replacement_costs = (

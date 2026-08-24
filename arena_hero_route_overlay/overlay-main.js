@@ -9,6 +9,26 @@
     beacon: "抢信标",
     migrate: "迁移",
   };
+  // 与 arena_hero_route_overlay_server.CONTROL_NUMBER_DEFAULTS / CONTROL_FLAG_DEFAULTS
+  // 保持一致：控制文件字段的默认值，用于面板回填与服务未就绪时的显示。
+  const CONTROL_NUMBER_DEFAULTS = {
+    beacon_target_distance: 0,
+    raid_vanguards: 1,
+    raid_rangers: 2,
+    aggress_vanguards: 0,
+    aggress_rangers: 0,
+    target_population: 20,
+    composition_workers: 12,
+    composition_vanguards: 4,
+    composition_rangers: 4,
+    browser_hint_distance: 32,
+  };
+  const CONTROL_FLAG_DEFAULTS = {
+    raid_enabled: false,
+    raid_recall: false,
+    hoard_stage1: false,
+    hoard_stage2: false,
+  };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
     return;
@@ -26,11 +46,8 @@
     control: {
       mode: "develop",
       recall: false,
-      raid_enabled: false,
-      raid_recall: false,
-      raid_vanguards: 1,
-      raid_rangers: 2,
-      beacon_target_distance: 0,
+      ...CONTROL_FLAG_DEFAULTS,
+      ...CONTROL_NUMBER_DEFAULTS,
     },
     settings: core.normalizeSettings({}),
     serviceOnline: false,
@@ -262,7 +279,6 @@
     });
     const label = document.createElement("span");
     label.textContent = labelText;
-    label.title = hintText;
     const input = document.createElement("input");
     input.type = "number";
     input.min = "0";
@@ -287,7 +303,108 @@
     });
     row.append(label, input);
     panel.appendChild(row);
-    state.settingInputs.set(key, { input, kind: "number" });
+    state.settingInputs.set(key, { input, label, hint: hintText, kind: "number" });
+    applyControlHint(key);
+  }
+
+  // 控制文件开关：与 addCheckbox 的区别是写入控制文件（updateControl）而不是
+  // 浏览器本地的显示设置（updateSettings）。
+  function addControlCheckbox(panel, key, labelText, hintText) {
+    const label = document.createElement("label");
+    Object.assign(label.style, {
+      display: "flex",
+      alignItems: "center",
+      gap: "8px",
+      minHeight: "26px",
+      cursor: "pointer",
+    });
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.addEventListener("change", () => {
+      updateControl({ [key]: input.checked });
+    });
+    const text = document.createElement("span");
+    text.textContent = labelText;
+    label.append(input, text);
+    panel.appendChild(label);
+    state.settingInputs.set(key, {
+      input,
+      label,
+      hint: hintText,
+      kind: "control-checkbox",
+    });
+    applyControlHint(key);
+  }
+
+  // 悬浮说明：hint 可以是字符串，也可以是每次刷新时重新求值的函数，用来把策略
+  // 当前实际生效的阶梯写进 tooltip。
+  function applyControlHint(key) {
+    const entry = state.settingInputs.get(key);
+    if (!entry || !entry.hint) {
+      return;
+    }
+    const text = typeof entry.hint === "function" ? entry.hint() : entry.hint;
+    if (entry.label) {
+      entry.label.title = text;
+    }
+    if (entry.input) {
+      entry.input.title = text;
+    }
+  }
+
+  function refreshControlHints() {
+    for (const [key, entry] of state.settingInputs) {
+      if (typeof entry.hint === "function") {
+        applyControlHint(key);
+      }
+    }
+  }
+
+  // 目标编制阶梯当前实际生效的一级，来自 strategy 回传的 stats。
+  function ladderStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.effective_target_population !== "number") {
+      return "当前生效：等待 Agent 上报";
+    }
+    if (stats.mode !== "develop") {
+      return `当前生效：${MODE_LABELS[stats.mode] || stats.mode}模式不使用阶梯，按该模式原策略产兵`;
+    }
+    const workers = stats.effective_workers;
+    const vanguards = stats.effective_vanguards;
+    const rangers = stats.effective_rangers;
+    const composition =
+      typeof workers === "number" &&
+      typeof vanguards === "number" &&
+      typeof rangers === "number"
+        ? `${workers}工 ${vanguards}先 ${rangers}游`
+        : "?";
+    if (stats.effective_target_population <= 0) {
+      return `当前生效：人口不限制，按项目默认 5:4:6 连续增长（基础编制 ${composition}）`;
+    }
+    return `当前生效：目标 ${stats.effective_target_population} 人 · ${composition}`;
+  }
+
+  function hoardStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.hoard_target !== "number") {
+      return "";
+    }
+    if (stats.hoard_target <= 0) {
+      return `\n当前生效：未在囤积（人口 ${stats.population ?? "?"} 未达门槛、本档未开启，或非发育模式）`;
+    }
+    return `\n当前生效：囤积目标 ${stats.hoard_target} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}`;
+  }
+
+  // 水晶提示的实时状态：抓取是否在线、当前采纳了几个提示。
+  function browserHintStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.browser_resource_hints !== "number") {
+      return "";
+    }
+    const online = stats.browser_intel_online
+      ? `抓取在线（${stats.browser_intel_age_seconds ?? "?"} 秒前）`
+      : `抓取离线（数据 ${stats.browser_intel_age_seconds ?? "?"} 秒前，超过 12 秒即失效）`;
+    return `\n当前生效：${online}，采纳 ${stats.browser_resource_hints} 个提示`;
   }
 
   function createLocatorPanel() {
@@ -617,6 +734,87 @@
       "独立偷袭编组的游侠数量；0 表示不抽调游侠",
       { maximum: 19, step: 1 },
     );
+    addControlNumber(
+      panel,
+      "browser_hint_distance",
+      "水晶提示搜索距离",
+      () =>
+        "叠加层从游戏页面读到的水晶坐标，只有距 Core 在此距离内才会派工人去验证；0 = 完全不使用提示。默认 32 格。" +
+        "\n数据来自客户端已探索缓存里标记为 RESOURCE 的格：工人曾经看到、当前已离开视野的水晶都在其中，不需要再走一趟就能识别。" +
+        "\n实测一局中期缓存有 2 万多格、其中 28 格是水晶；离家最近的往往在 40~70 格，所以默认 32 常常一个都用不上，可试 48~70。" +
+        "\n每次最多只派 1 名工人去验证（BROWSER_RESOURCE_SCOUT_LIMIT），其余工人保持正常采集。" +
+        "\n配套约束：采集目标本身还受 38 格 leash 限制，但已走到矿点 3 格内的工人可以采完。" +
+        browserHintStatusText(),
+      { maximum: 200, step: 4 },
+    );
+
+    const ladderTitle = document.createElement("div");
+    ladderTitle.textContent = "发育模式 · 目标编制与囤积";
+    Object.assign(ladderTitle.style, {
+      color: "#8f9cad",
+      fontSize: "11px",
+      marginTop: "9px",
+      marginBottom: "3px",
+      borderTop: "1px solid rgba(255,255,255,0.12)",
+      paddingTop: "7px",
+    });
+    panel.appendChild(ladderTitle);
+    addControlCheckbox(
+      panel,
+      "hoard_stage1",
+      "人口达到 20 后优先将资源攒到 95",
+      () =>
+        "【develop 发育模式】人口达到 20 后先把资源攒到 95（人口 20 的仓库容量为 100）再产兵。" +
+        "\n攒够放行一次产兵，花掉后重新攒回 95，常态维持接近满仓的库存。" +
+        "\n人口 20 起单位涨价 30%，爆兵性价比骤降，高库存换来随时治疗、修盾与爆发补兵。" +
+        "\n破例放行：Core 5 格内有敌 / 守家 3先+3游 未补齐 / 灾后重建 / 工人少于 4。" +
+        "\n注意：囤积生效期间会押后自动抢信标，保持在发育模式。" +
+        hoardStatusText(),
+    );
+    addControlCheckbox(
+      panel,
+      "hoard_stage2",
+      "人口达到 30 后优先将资源攒到 150",
+      () =>
+        "【develop 发育模式】人口达到 30 后先把资源攒到 150（人口 30 的仓库容量正好 150，即满仓）再产兵。" +
+        "\n两档独立，同时命中时取较高目标；人口 30 起单位价格已是基础价的 2.2 倍。" +
+        "\n人口正好 30 时目标等于容量上限，攒满期间仓库无空位，载货工人会 cargo_queue_hold 等产兵腾位（人口 31 起容量 155 就有余量）。" +
+        "\n破例放行：Core 5 格内有敌 / 守家 3先+3游 未补齐 / 灾后重建 / 工人少于 4。" +
+        "\n注意：囤积生效期间会押后自动抢信标，保持在发育模式。" +
+        hoardStatusText(),
+    );
+    addControlNumber(
+      panel,
+      "target_population",
+      "目标人口",
+      () =>
+        "【develop 发育模式】目标编制阶梯第一级的人口，默认 20。" +
+        "\n达成后自动升到第二级 30 人 18:6:6；两级都达成后取消人口目标，回落项目默认 5:4:6 连续增长。" +
+        "\n0 = 人口不限制，全程使用项目原策略（12工+4先+5游 后按 5:4:6 无上限增长）。" +
+        "\n阶梯生效期间会押后自动抢信标（原策略在 4先+5游 时切换）；设为 0 且关掉囤积即恢复。" +
+        "\n" +
+        ladderStatusText(),
+      { maximum: 200, step: 1 },
+    );
+    for (const [key, labelText] of [
+      ["composition_workers", "配比 · 工人"],
+      ["composition_vanguards", "配比 · 先锋"],
+      ["composition_rangers", "配比 · 游侠"],
+    ]) {
+      addControlNumber(
+        panel,
+        key,
+        labelText,
+        () =>
+          "【develop 发育模式】目标人口按此配比拆成工人/先锋/游侠三个目标，默认 12:4:4（合计正好 20）。" +
+          "\n同时作为基础编制完成后的连续增长权重；配比设为 0:0:0 表示使用项目原策略 5:4:6。" +
+          "\n单项设为 0 表示不再生产该兵种。每级内部顺序与原策略一致：先锋 → 游侠 → 工人。" +
+          "\n默认 12:4:4 与 develop 原编制 12工4先5游 只差 1 名游侠，让总数正好落在人口 20 的涨价档前。" +
+          "\n" +
+          ladderStatusText(),
+        { maximum: 200, step: 1 },
+      );
+    }
 
     const reset = document.createElement("button");
     reset.type = "button";
@@ -1520,16 +1718,19 @@
       state.raidRecallButton.textContent = recall ? "偷袭解除召回" : "偷袭召回";
       state.raidRecallButton.style.color = recall ? "#d98a7a" : "#9bcbbd";
     }
-    if (state.settingInputs.has("beacon_target_distance")) {
-      const entry = state.settingInputs.get("beacon_target_distance");
-      entry.input.value = String(state.control.beacon_target_distance ?? 0);
-    }
-    for (const key of ["raid_vanguards", "raid_rangers"]) {
+    for (const [key, fallback] of Object.entries(CONTROL_NUMBER_DEFAULTS)) {
       const entry = state.settingInputs.get(key);
       if (entry) {
-        entry.input.value = String(state.control[key] ?? (key === "raid_vanguards" ? 1 : 2));
+        entry.input.value = String(state.control[key] ?? fallback);
       }
     }
+    for (const [key, fallback] of Object.entries(CONTROL_FLAG_DEFAULTS)) {
+      const entry = state.settingInputs.get(key);
+      if (entry && entry.kind === "control-checkbox") {
+        entry.input.checked = Boolean(state.control[key] ?? fallback);
+      }
+    }
+    refreshControlHints();
     if (state.statsPanel) {
       state.statsPanel.style.display = state.statsOpen ? "block" : "none";
     }
@@ -2490,45 +2691,39 @@
         state.stats = message.payload;
         centerFollowedUnit();
         renderStatusBar();
+        refreshControlHints();
         if (state.locatorOpen) {
           renderLocator();
         }
       } else if (message.kind === "logs" && message.payload && typeof message.payload === "object") {
         updateLogs(message.payload);
       } else if (message.kind === "control" && message.payload && typeof message.payload === "object") {
-        state.control = {
+        const next = {
           mode: ["develop", "aggress", "beacon", "migrate"].includes(message.payload.mode)
             ? message.payload.mode
             : "develop",
           recall: Boolean(message.payload.recall),
-          raid_enabled: Boolean(message.payload.raid_enabled),
-          raid_recall: Boolean(message.payload.raid_recall),
-          raid_vanguards:
-            typeof message.payload.raid_vanguards === "number"
-              ? message.payload.raid_vanguards
-              : state.control.raid_vanguards ?? 1,
-          raid_rangers:
-            typeof message.payload.raid_rangers === "number"
-              ? message.payload.raid_rangers
-              : state.control.raid_rangers ?? 2,
-          beacon_target_distance:
-            typeof message.payload.beacon_target_distance === "number"
-              ? message.payload.beacon_target_distance
-              : state.control.beacon_target_distance ?? 0,
           rally_point:
             Array.isArray(message.payload.rally_point) &&
             message.payload.rally_point.length === 2
               ? [Number(message.payload.rally_point[0]), Number(message.payload.rally_point[1])]
               : null,
-          aggress_vanguards:
-            typeof message.payload.aggress_vanguards === "number"
-              ? message.payload.aggress_vanguards
-              : state.control.aggress_vanguards ?? 0,
-          aggress_rangers:
-            typeof message.payload.aggress_rangers === "number"
-              ? message.payload.aggress_rangers
-              : state.control.aggress_rangers ?? 0,
         };
+        // 服务端未回传的字段保留面板当前值，再回退到默认表，避免新增字段忘记
+        // 加进白名单时被静默丢弃。
+        for (const [key, fallback] of Object.entries(CONTROL_NUMBER_DEFAULTS)) {
+          next[key] =
+            typeof message.payload[key] === "number"
+              ? message.payload[key]
+              : state.control[key] ?? fallback;
+        }
+        for (const [key, fallback] of Object.entries(CONTROL_FLAG_DEFAULTS)) {
+          next[key] =
+            typeof message.payload[key] === "boolean"
+              ? message.payload[key]
+              : Boolean(state.control[key] ?? fallback);
+        }
+        state.control = next;
         syncControls();
         renderStatusBar();
       } else if (message.kind === "status") {

@@ -84,69 +84,161 @@ assert.equal(overlay.centerCameraOn(focusCanvas, [-52, -210]), true);
 assert.deepEqual(centeredCamera, { x: -52, y: -210, cell: 44 });
 assert.equal(overlay.centerCameraOn({}, [-52, -210]), false);
 
+// 资源识别按游戏数据契约精确读取：
+//   props.state.objects 里 kind==="RESOURCE" 的 TerrainView（坐标在复数 positions）
+//   props.explored 缓存里 kind==="RESOURCE" 的格（工人看过、当前已离开视野的水晶）
 const resourceCanvas = { parentElement: null };
+const exploredCache = new Map([
+  ["-40,20", { position: [-40, 20], kind: "EMPTY" }],
+  ["-41,20", { position: [-41, 20], kind: "OBSTACLE" }],
+  ["-23,86", { position: [-23, 86], kind: "RESOURCE" }],
+  // value 里没有 position 时回退用 "x,y" 形式的键
+  ["-90,120", { kind: "RESOURCE" }],
+]);
 Object.defineProperty(resourceCanvas, "__reactFiber$resourceTest", {
   value: {
-    memoizedState: {
-      memoizedState: {
-        resources: [
-          [-62, 68],
-          { position: [-61, 76], type: "iron_ore" },
-          { x: -23, y: 86, kind: "resource_node" },
+    memoizedProps: {
+      state: {
+        objects: [
+          { kind: "RESOURCE", positions: [[-62, 68], [-61, 76]] },
+          { kind: "OBSTACLE", positions: [[-10, 10], [-11, 10]] },
+          { kind: "CORE", position: [0, 0], hp: 5 },
+          { kind: "UNIT", position: [1, 0] },
         ],
       },
-      baseState: null,
-      queue: null,
-      next: null,
+      explored: exploredCache,
     },
-    memoizedProps: null,
+    memoizedState: null,
     pendingProps: null,
     stateNode: null,
+    child: null,
+    sibling: null,
     return: null,
     alternate: null,
   },
 });
-assert.deepEqual(overlay.findResourceCells(resourceCanvas), [
-  [-62, 68],
-  [-61, 76],
-  [-23, 86],
-]);
+assert.deepEqual(
+  overlay.findResourceCells(resourceCanvas).sort((a, b) => a[0] - b[0] || a[1] - b[1]),
+  [
+    [-90, 120],
+    [-62, 68],
+    [-61, 76],
+    [-23, 86],
+  ].sort((a, b) => a[0] - b[0] || a[1] - b[1]),
+  "只取 RESOURCE，OBSTACLE/EMPTY/CORE/UNIT 一律忽略",
+);
 
-// 误报过滤：8x8 区块内资源点 >32（过半）视为误抓的成片区域，整块丢弃；
-// 正常稀疏资源点保留。
+// 回归：字段名含 "ore" 的容器（如 explored）不再被误当资源。
+// 旧实现用 /(resource|mine|ore|...)/i 匹配字段名，"expl-ore-d" 命中 ore，
+// 导致 2 万多格空地和岩石被当成资源点，实测误报率 100%。
+{
+  const trapCanvas = { parentElement: null };
+  const trapExplored = new Map();
+  for (let index = 0; index < 300; index += 1) {
+    trapExplored.set(`${-500 + index},-300`, {
+      position: [-500 + index, -300],
+      kind: index % 2 ? "EMPTY" : "OBSTACLE",
+    });
+  }
+  Object.defineProperty(trapCanvas, "__reactFiber$trapTest", {
+    value: {
+      memoizedProps: {
+        explored: trapExplored,
+        // 这些字段名都含资源关键词，但不符合数据契约，必须被忽略
+        store: [[1, 1], [2, 2]],
+        ignore: { position: [3, 3] },
+        resourceSprites: [{ x: 4, y: 4, name: "" }],
+      },
+      memoizedState: null,
+      pendingProps: null,
+      stateNode: null,
+      child: null,
+      sibling: null,
+      return: null,
+      alternate: null,
+    },
+  });
+  assert.deepEqual(
+    overlay.findResourceCells(trapCanvas),
+    [],
+    "含 ore/resource 字样但非 RESOURCE 契约的数据必须全部忽略",
+  );
+}
+
+// 兄弟组件里的状态也要能抓到：旧实现只沿 return/alternate 向上，整支 sibling 会漏掉。
+{
+  const siblingCanvas = { parentElement: null };
+  Object.defineProperty(siblingCanvas, "__reactFiber$siblingTest", {
+    value: {
+      memoizedProps: null,
+      memoizedState: null,
+      pendingProps: null,
+      stateNode: null,
+      child: {
+        memoizedProps: null,
+        memoizedState: null,
+        pendingProps: null,
+        stateNode: null,
+        child: null,
+        sibling: {
+          memoizedProps: {
+            state: { objects: [{ kind: "RESOURCE", positions: [[7, 7]] }] },
+          },
+          memoizedState: null,
+          pendingProps: null,
+          stateNode: null,
+          child: null,
+          sibling: null,
+          return: null,
+          alternate: null,
+        },
+        return: null,
+        alternate: null,
+      },
+      sibling: null,
+      return: null,
+      alternate: null,
+    },
+  });
+  assert.deepEqual(overlay.findResourceCells(siblingCanvas), [[7, 7]]);
+}
+
+assert.deepEqual(overlay.findResourceCells({}), [], "无 fiber 时返回空数组");
+
+// 误报兜底过滤仍然生效：万一游戏改数据结构，成片坐标不至于灌进策略。
 {
   const dense = [];
   for (let bx = 0; bx < 8; bx += 1) {
     for (let by = 0; by < 8; by += 1) {
-      dense.push([-128 + bx, -240 + by]); // 单 8x8 区块 64 格全满的假数据（对齐真实误报特征）
+      dense.push([-128 + bx, -240 + by]); // 单 8x8 区块 64 格全满
     }
   }
   const fakeCanvas = { parentElement: null };
   Object.defineProperty(fakeCanvas, "__reactFiber$denseTest", {
     value: {
-      memoizedState: {
-        memoizedState: {
-          resources: [
-            ...dense,
-            [-62, 68],
-            { position: [-61, 76], type: "iron_ore" },
+      memoizedProps: {
+        state: {
+          objects: [
+            { kind: "RESOURCE", positions: [...dense, [-62, 68], [-61, 76]] },
           ],
         },
-        baseState: null,
-        queue: null,
-        next: null,
       },
-      memoizedProps: null,
+      memoizedState: null,
       pendingProps: null,
       stateNode: null,
+      child: null,
+      sibling: null,
       return: null,
       alternate: null,
     },
   });
-  assert.deepEqual(overlay.findResourceCells(fakeCanvas), [
-    [-62, 68],
-    [-61, 76],
-  ]);
+  assert.deepEqual(
+    overlay.findResourceCells(fakeCanvas).sort((a, b) => a[0] - b[0]),
+    [
+      [-62, 68],
+      [-61, 76],
+    ].sort((a, b) => a[0] - b[0]),
+  );
 }
 
 assert.deepEqual(
@@ -249,5 +341,65 @@ for (const panel of [
   assert.ok(panel.left + panel.width <= 350);
 }
 assert.equal(overlay.calculateControlLayout({}, 20, 720), null);
+
+// 资源误报过滤：零散水晶保留，成片地形整块丢弃。
+{
+  const scattered = [
+    [0, 0],
+    [40, 40],
+    [80, 80],
+  ];
+  assert.deepEqual(
+    overlay.pruneImplausibleResourceCells(scattered),
+    scattered,
+    "零散单格应原样保留",
+  );
+
+  // 紧邻小簇（4 格）保留：真实水晶可能成对或小簇出现。
+  const smallCluster = [
+    [0, 0],
+    [0, 1],
+    [1, 0],
+    [1, 1],
+  ];
+  assert.equal(
+    overlay.pruneImplausibleResourceCells(smallCluster).length,
+    4,
+    "4 格小簇应保留",
+  );
+
+  // 5 格连通块超过上限，整块丢弃。
+  assert.deepEqual(
+    overlay.pruneImplausibleResourceCells([
+      [0, 0],
+      [0, 1],
+      [1, 0],
+      [1, 1],
+      [2, 1],
+    ]),
+    [],
+    "超过 4 格的连通块应整块丢弃",
+  );
+
+  // 混合场景：成片地形被清除，远处零散水晶保留。
+  const terrain = [];
+  for (let x = 0; x < 10; x += 1) {
+    for (let y = 0; y < 6; y += 1) {
+      terrain.push([x, y]);
+    }
+  }
+  assert.deepEqual(
+    overlay
+      .pruneImplausibleResourceCells(terrain.concat([[500, 500], [900, 900]]))
+      .sort((a, b) => a[0] - b[0]),
+    [
+      [500, 500],
+      [900, 900],
+    ],
+    "成片地形清除后应只剩零散水晶",
+  );
+
+  assert.deepEqual(overlay.pruneImplausibleResourceCells([]), []);
+}
 
 console.log("overlay-core tests passed");

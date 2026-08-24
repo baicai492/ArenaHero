@@ -396,18 +396,20 @@
     }
   }
 
-  const RESOURCE_KEY_RE = /(resource|mine|ore|mineral|crystal|deposit|resource.?node)/i;
-  const RESOURCE_CONTAINER_KEYS = new Set([
-    "resources",
-    "resourceCells",
-    "resource_cells",
-    "resourceNodes",
-    "resource_nodes",
-    "mines",
-    "minerals",
-    "ore",
-    "nodes",
-  ]);
+  // 2026-08-24 改为按游戏数据契约精确读取，不再用关键词正则猜字段。
+  // 旧实现用 /(resource|mine|ore|...)/i 匹配字段名，而 "explored"（已探索地图缓存）
+  // 里含有 "ore"，于是 2 万多格空地和岩石被整体当成资源点，实测误报率 100%；
+  // 这些数据还会吃光遍历预算，让真正的资源格没机会被访问。
+  //
+  // 两个数据源（与 arena_hero/models.py 的 TerrainView / 客户端缓存一致）：
+  //   props.state.objects  — 服务端当前 Turn 下发的视野对象，kind==="RESOURCE"
+  //                          时坐标在复数 positions 数组里。与策略同源。
+  //   props.explored       — 客户端已探索缓存 Map，key 为 "x,y"，value.kind 可能是
+  //                          EMPTY / OBSTACLE / RESOURCE。其中的 RESOURCE 是工人
+  //                          曾经看到、当前已离开视野的水晶，这才是 API 之外的
+  //                          增量信息，也是本功能存在的理由。
+  const RESOURCE_KIND = "RESOURCE";
+  const EXPLORED_SCAN_LIMIT = 60000;
 
   function integerPosition(value) {
     const point = normalizePosition(value);
@@ -416,85 +418,71 @@
       : null;
   }
 
-  function resourceRecordPosition(value, keyHint) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
+  // "x,y" 形式的缓存键
+  function positionFromKey(key) {
+    if (typeof key !== "string") {
       return null;
     }
-    for (const key of ["position", "coordinates", "coordinate", "cell", "gridPosition", "grid_position", "tile", "location"]) {
-      const point = integerPosition(value[key]);
-      if (point) {
-        const semantic = RESOURCE_KEY_RE.test(keyHint || "") ||
-          ["resource", "resourceType", "resource_type", "kind", "type", "category", "name"].some((keyName) =>
-            RESOURCE_KEY_RE.test(String(value[keyName] || ""))
-          );
-        if (semantic) {
-          return point;
-        }
-      }
+    const parts = key.split(",");
+    if (parts.length !== 2) {
+      return null;
     }
-    if (Number.isInteger(value.x) && Number.isInteger(value.y)) {
-      const semantic = RESOURCE_KEY_RE.test(keyHint || "") ||
-        ["resource", "resourceType", "resource_type", "kind", "type", "category", "name"].some((keyName) =>
-          RESOURCE_KEY_RE.test(String(value[keyName] || ""))
-        );
-      if (semantic) {
-        return [value.x, value.y];
-      }
-    }
-    return null;
+    const x = Number(parts[0]);
+    const y = Number(parts[1]);
+    return Number.isInteger(x) && Number.isInteger(y) ? [x, y] : null;
   }
 
-  function collectResourceCells(value, keyHint, output, seen, budget, depth) {
-    if (budget.count >= 6000 || depth > 8 || value === null || value === undefined) {
+  function isResourceKind(value) {
+    return (
+      value !== null &&
+      typeof value === "object" &&
+      String(value.kind ?? value.type ?? "") === RESOURCE_KIND
+    );
+  }
+
+  // 服务端下发的视野对象：TerrainView 用复数 positions，其它视图用单数 position。
+  function collectStateObjectResources(objects, output) {
+    if (!Array.isArray(objects)) {
       return;
     }
-    if (typeof value !== "object") {
-      return;
-    }
-    if (seen.has(value)) {
-      return;
-    }
-    seen.add(value);
-    budget.count += 1;
-    if (value instanceof Map) {
-      for (const [key, item] of Array.from(value.entries()).slice(0, 4096)) {
-        collectResourceCells(key, keyHint, output, seen, budget, depth + 1);
-        collectResourceCells(item, keyHint, output, seen, budget, depth + 1);
-      }
-      return;
-    }
-    if (value instanceof Set) {
-      for (const item of Array.from(value.values()).slice(0, 4096)) {
-        collectResourceCells(item, keyHint, output, seen, budget, depth + 1);
-      }
-      return;
-    }
-    if (Array.isArray(value)) {
-      if (RESOURCE_KEY_RE.test(keyHint || "")) {
-        const direct = integerPosition(value);
-        if (direct) {
-          output.set(`${direct[0]},${direct[1]}`, direct);
-          return;
-        }
-      }
-      for (const item of value.slice(0, 4096)) {
-        collectResourceCells(item, keyHint, output, seen, budget, depth + 1);
-      }
-      return;
-    }
-    const record = resourceRecordPosition(value, keyHint);
-    if (record) {
-      output.set(`${record[0]},${record[1]}`, record);
-    }
-    for (const [key, nested] of Object.entries(value)) {
-      if (nested === null || nested === undefined || typeof nested !== "object") {
+    for (const object of objects.slice(0, 4096)) {
+      if (!isResourceKind(object)) {
         continue;
       }
-      const relevant = RESOURCE_KEY_RE.test(key) ||
-        RESOURCE_CONTAINER_KEYS.has(key) ||
-        key === "data" || key === "state" || key === "map" || key === "game" || key === "world";
-      if (relevant || depth < 3) {
-        collectResourceCells(nested, key, output, seen, budget, depth + 1);
+      if (Array.isArray(object.positions)) {
+        for (const candidate of object.positions.slice(0, 4096)) {
+          const point = integerPosition(candidate);
+          if (point) {
+            output.set(`${point[0]},${point[1]}`, point);
+          }
+        }
+        continue;
+      }
+      const single = integerPosition(object.position);
+      if (single) {
+        output.set(`${single[0]},${single[1]}`, single);
+      }
+    }
+  }
+
+  // 客户端已探索缓存：只取标记为 RESOURCE 的格。缓存会随探索持续增长（实测
+  // 22010 格），因此按 EXPLORED_SCAN_LIMIT 兜底，避免极端情况下卡住渲染循环。
+  function collectExploredResources(explored, output) {
+    if (!(explored instanceof Map)) {
+      return;
+    }
+    let scanned = 0;
+    for (const [key, value] of explored) {
+      if (scanned >= EXPLORED_SCAN_LIMIT) {
+        break;
+      }
+      scanned += 1;
+      if (!isResourceKind(value)) {
+        continue;
+      }
+      const point = integerPosition(value.position) || positionFromKey(key);
+      if (point) {
+        output.set(`${point[0]},${point[1]}`, point);
       }
     }
   }
@@ -504,38 +492,30 @@
     if (!first) {
       return [];
     }
-    const queue = [{ fiber: first, depth: 0 }];
-    const seenFibers = new Set();
     const values = new Map();
-    const seenValues = new Set();
-    const budget = { count: 0 };
-    while (queue.length && seenFibers.size < 160 && budget.count < 6000) {
-      const { fiber, depth } = queue.shift();
-      if (!fiber || seenFibers.has(fiber) || depth > 32) {
+    const seenFibers = new Set();
+    // 完整遍历 fiber 树：旧实现只沿 return/alternate 向上，兄弟组件里的状态会被
+    // 整支漏掉。数据实测挂在地图组件的 props 上，补 child/sibling 才稳妥。
+    const queue = [first];
+    while (queue.length && seenFibers.size < 3000) {
+      const fiber = queue.shift();
+      if (!fiber || seenFibers.has(fiber)) {
         continue;
       }
       seenFibers.add(fiber);
-      collectResourceCells(fiber.memoizedProps, "props", values, seenValues, budget, 0);
-      collectResourceCells(fiber.pendingProps, "props", values, seenValues, budget, 0);
-      collectResourceCells(fiber.stateNode && fiber.stateNode.state, "state", values, seenValues, budget, 0);
-      let hook = fiber.memoizedState;
-      const seenHooks = new Set();
-      let hookIndex = 0;
-      while (hook && typeof hook === "object" && !seenHooks.has(hook) && hookIndex < 64) {
-        seenHooks.add(hook);
-        collectResourceCells(hook.memoizedState, "hook", values, seenValues, budget, 0);
-        collectResourceCells(hook.baseState, "hook", values, seenValues, budget, 0);
-        if (hook.queue) {
-          collectResourceCells(hook.queue.lastRenderedState, "hook", values, seenValues, budget, 0);
+      for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
+        if (!props || typeof props !== "object") {
+          continue;
         }
-        hook = hook.next;
-        hookIndex += 1;
+        if (props.state && typeof props.state === "object") {
+          collectStateObjectResources(props.state.objects, values);
+        }
+        collectStateObjectResources(props.objects, values);
+        collectExploredResources(props.explored, values);
       }
-      queue.push({ fiber: fiber.return, depth: depth + 1 });
-      queue.push({ fiber: fiber.alternate, depth });
+      queue.push(fiber.child, fiber.sibling, fiber.return, fiber.alternate);
     }
-    const collected = Array.from(values.values());
-    return pruneImplausibleResourceCells(collected);
+    return pruneImplausibleResourceCells(Array.from(values.values()));
   }
 
   // 合理性过滤：真实资源点在 8x8 区块内不会成片密集。
@@ -543,6 +523,11 @@
   // 8x8 区块 > 32 格（过半）即视为误报，整块丢弃，避免污染策略的 known_resource_cells。
   const RESOURCE_CELL_BLOCK = 8;
   const RESOURCE_CELL_BLOCK_QUOTA = 32;
+  // 2026-08-24 第二道过滤：连通块大小。区块配额只能挡住"整块几乎填满"的误报，
+  // 挡不住跨区块延伸的成片地形（实测一次快照 790 个坐标里，97% 属于 22 个大于
+  // 4 格的连通块，最大的一块 77 格、包围盒 10x21、填充率 37%，正是岩石群的形态）。
+  // 天然水晶是零散单格或紧邻的小簇，因此超过此大小的 8 邻域连通块整块丢弃。
+  const RESOURCE_CELL_MAX_CLUSTER = 4;
 
   function pruneImplausibleResourceCells(positions) {
     if (!positions.length) {
@@ -561,16 +546,58 @@
         denseBlocks.add(key);
       }
     }
-    if (!denseBlocks.size) {
+    let pruned = positions;
+    if (denseBlocks.size) {
+      pruned = positions.filter((position) => {
+        const key = `${Math.floor(position[0] / RESOURCE_CELL_BLOCK)},${Math.floor(
+          position[1] / RESOURCE_CELL_BLOCK,
+        )}`;
+        return !denseBlocks.has(key);
+      });
+    }
+    return pruneLargeResourceClusters(pruned);
+  }
+
+  // 8 邻域洪泛，丢弃大于 RESOURCE_CELL_MAX_CLUSTER 的连通块。
+  function pruneLargeResourceClusters(positions) {
+    if (positions.length <= RESOURCE_CELL_MAX_CLUSTER) {
       return positions;
     }
-    const pruned = positions.filter((position) => {
-      const key = `${Math.floor(position[0] / RESOURCE_CELL_BLOCK)},${Math.floor(
-        position[1] / RESOURCE_CELL_BLOCK,
-      )}`;
-      return !denseBlocks.has(key);
-    });
-    return pruned;
+    const index = new Map();
+    for (const position of positions) {
+      index.set(`${position[0]},${position[1]}`, position);
+    }
+    const visited = new Set();
+    const kept = [];
+    for (const [startKey] of index) {
+      if (visited.has(startKey)) {
+        continue;
+      }
+      const cluster = [];
+      const stack = [startKey];
+      visited.add(startKey);
+      while (stack.length) {
+        const key = stack.pop();
+        const cell = index.get(key);
+        cluster.push(cell);
+        for (let dx = -1; dx <= 1; dx += 1) {
+          for (let dy = -1; dy <= 1; dy += 1) {
+            if (!dx && !dy) {
+              continue;
+            }
+            const neighbour = `${cell[0] + dx},${cell[1] + dy}`;
+            if (index.has(neighbour) && !visited.has(neighbour)) {
+              visited.add(neighbour);
+              stack.push(neighbour);
+            }
+          }
+        }
+      }
+      if (cluster.length <= RESOURCE_CELL_MAX_CLUSTER) {
+        kept.push(...cluster);
+      }
+    }
+    return kept;
   }
 
   return {
@@ -587,6 +614,7 @@
     normalizePosition,
     normalizeSettings,
     pathTurnPoints,
+    pruneImplausibleResourceCells,
     screenToGrid,
   };
 });
