@@ -405,6 +405,42 @@
     return `\n当前生效：囤积目标 ${stats.hoard_target} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}\n${mode}`;
   }
 
+  // 编制阶梯的四个输入框显示"当前实际生效的那一级"，而不是控制文件里的原始
+  // 设定：阶梯推进到第二级后面板自动变成 30 / 18:6:6，用户在此基础上改动即等于
+  // 设定下一级目标（改成 >30 就继续按新目标走，不改就在本级完成后回落 5:4:6）。
+  // 返回 null 表示没有生效中的阶梯（阶梯用尽、非 develop、或未开启），由调用方
+  // 回退到控制文件原值。
+  function ladderInputValue(key) {
+    const stats = state.stats;
+    if (!stats || stats.mode !== "develop") {
+      return null;
+    }
+    const workers = stats.effective_workers;
+    const vanguards = stats.effective_vanguards;
+    const rangers = stats.effective_rangers;
+    if (
+      (stats.effective_target_population ?? 0) <= 0 ||
+      typeof workers !== "number" ||
+      typeof vanguards !== "number" ||
+      typeof rangers !== "number"
+    ) {
+      return null;
+    }
+    switch (key) {
+      // 目标人口显示本级编制之和（20 / 30），不含超产；超产在 tooltip 里说明。
+      case "target_population":
+        return workers + vanguards + rangers;
+      case "composition_workers":
+        return workers;
+      case "composition_vanguards":
+        return vanguards;
+      case "composition_rangers":
+        return rangers;
+      default:
+        return null;
+    }
+  }
+
   // 水晶提示的实时状态：抓取是否在线、当前采纳了几个提示。
   function browserHintStatusText() {
     const stats = state.stats;
@@ -872,8 +908,9 @@
       "target_population",
       "目标人口",
       () =>
-        "【develop 发育模式】目标编制阶梯第一级的人口，默认 20。" +
-        "\n达成后自动升到第二级 30 人 18:6:6；两级都达成后取消人口目标，回落项目默认 5:4:6 连续增长。" +
+        "【develop 发育模式】目标编制阶梯当前生效那一级的人口，默认第一级 20。" +
+        "\n输入框显示的是实际生效的那一级：编制达成（勾了本级囤积还需攒够水位）后会自动变成第二级 30，配比同时变成 18:6:6。" +
+        "\n在此基础上改动即等于设定下一级目标：改成大于 30 的值就继续按新目标走；不改（≤30）则本级完成后回落项目默认 5:4:6 连续增长。" +
         "\n0 = 人口不限制，全程使用项目原策略（12工+4先+5游 后按 5:4:6 无上限增长）。" +
         "\n阶梯生效期间会押后自动抢信标（原策略在 4先+5游 时切换）；设为 0 且关掉囤积即恢复。" +
         "\n" +
@@ -890,7 +927,8 @@
         key,
         labelText,
         () =>
-          "【develop 发育模式】目标人口按此配比拆成工人/先锋/游侠三个目标，默认 12:4:4（合计正好 20）。" +
+          "【develop 发育模式】目标人口按此配比拆成工人/先锋/游侠三个目标，第一级默认 12:4:4（合计正好 20）。" +
+          "\n输入框显示的是实际生效的那一级：升到第二级后自动变成 18:6:6。改动即等于设定下一级目标。" +
           "\n同时作为基础编制完成后的连续增长权重；配比设为 0:0:0 表示使用项目原策略 5:4:6。" +
           "\n单项设为 0 表示不再生产该兵种。每级内部顺序与原策略一致：先锋 → 游侠 → 工人。" +
           "\n默认 12:4:4 与 develop 原编制 12工4先5游 只差 1 名游侠，让总数正好落在人口 20 的涨价档前。" +
@@ -1804,9 +1842,16 @@
     }
     for (const [key, fallback] of Object.entries(CONTROL_NUMBER_DEFAULTS)) {
       const entry = state.settingInputs.get(key);
-      if (entry) {
-        entry.input.value = String(state.control[key] ?? fallback);
+      if (!entry) {
+        continue;
       }
+      // 用户正在输入时不要覆盖，否则每次轮询都会打断编辑。
+      if (document.activeElement === entry.input) {
+        continue;
+      }
+      entry.input.value = String(
+        ladderInputValue(key) ?? state.control[key] ?? fallback,
+      );
     }
     for (const [key, fallback] of Object.entries(CONTROL_FLAG_DEFAULTS)) {
       const entry = state.settingInputs.get(key);
@@ -2795,6 +2840,8 @@
         centerFollowedUnit();
         renderStatusBar();
         refreshControlHints();
+        // 阶梯推进后四个编制输入框要跟着显示新一级的目标。
+        syncControls();
         if (state.locatorOpen) {
           renderLocator();
         }

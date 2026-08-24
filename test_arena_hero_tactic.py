@@ -8855,6 +8855,76 @@ class CompositionLadderTests(unittest.TestCase):
             ),
         )
 
+    def test_user_can_extend_ladder_past_stage_two(self) -> None:
+        """30 之后：不改设定则回落 5:4:6，改大目标则继续按新设定补。
+
+        面板的四个编制输入框显示"当前生效那一级"，用户在此基础上改动即等于设定
+        下一级目标。目标人口 ≤30（等于没改）时第二级完成后回落项目原策略。
+        """
+
+        reached_stage_two = (18, 6, 6)
+        resources = HOARD_STAGE2_RESOURCE_TARGET
+
+        def memory_with(target: int, weights: tuple[int, int, int]) -> TacticMemory:
+            memory = TacticMemory()
+            memory.target_population = target
+            memory.composition_workers = weights[0]
+            memory.composition_vanguards = weights[1]
+            memory.composition_rangers = weights[2]
+            memory.hoard_stage1 = True
+            memory.hoard_stage2 = True
+            return memory
+
+        # 不改设定（20/12:4:4）或改成等于第二级（30/18:6:6）→ 阶梯用尽，回落 5:4:6
+        for target, weights, label in (
+            (20, (12, 4, 4), "保持第一级设定"),
+            (30, (18, 6, 6), "改成第二级同值"),
+        ):
+            memory = memory_with(target, weights)
+            self.assertIsNone(
+                _effective_composition(memory, *reached_stage_two, resources),
+                f"{label}：第二级完成后应取消人口目标",
+            )
+            self.assertEqual(
+                _effective_growth_profile(memory, *reached_stage_two, resources),
+                CONTINUOUS_GROWTH_PROFILE,
+                f"{label}：应回落项目默认 5:4:6",
+            )
+
+        # 改成大于 30 的目标 → 成为新一级，继续补
+        memory = memory_with(40, (20, 8, 12))
+        self.assertEqual(
+            _effective_composition(memory, *reached_stage_two, resources),
+            (20, 8, 12),
+        )
+        self.assertEqual(
+            {unit: weight for unit, weight in _effective_growth_profile(
+                memory, *reached_stage_two, resources
+            )},
+            {UnitType.WORKER: 20, UnitType.VANGUARD: 8, UnitType.RANGER: 12},
+        )
+
+    def test_stage_two_hoard_covers_population_thirty_and_beyond(self) -> None:
+        """第二档水位覆盖「30 及之后」，不是只在 30 那一刻。"""
+
+        memory = TacticMemory()
+        memory.hoard_stage1 = True
+        memory.hoard_stage2 = True
+        self.assertEqual(
+            _hoard_resource_target(memory, HOARD_STAGE2_POPULATION - 1, 0),
+            HOARD_STAGE1_RESOURCE_TARGET,
+        )
+        for population in (
+            HOARD_STAGE2_POPULATION,
+            HOARD_STAGE2_POPULATION + 1,
+            HOARD_STAGE2_POPULATION + 50,
+        ):
+            self.assertEqual(
+                _hoard_resource_target(memory, population, 0),
+                HOARD_STAGE2_RESOURCE_TARGET,
+                f"人口 {population} 应维持 150 水位",
+            )
+
     def test_ladder_disabled_by_zero_and_outside_develop(self) -> None:
         memory = TacticMemory()
         memory.target_population = 0
