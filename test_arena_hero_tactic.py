@@ -2984,6 +2984,128 @@ class BalancedTacticTests(unittest.TestCase):
 
         self.assertEqual(memory.browser_hint_distance, 48)
 
+    def test_resource_leash_and_scout_limit_read_from_control_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "develop",
+                        "resource_leash_distance": 56,
+                        "browser_scout_limit": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            self.assertEqual(
+                memory.resource_leash_distance,
+                DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE,
+            )
+            self.assertEqual(memory.browser_scout_limit, 1)
+            memory.load_control(control_path)
+
+        self.assertEqual(memory.resource_leash_distance, 56)
+        self.assertEqual(memory.browser_scout_limit, 3)
+
+    def test_resource_leash_distance_gates_far_visible_resource(self) -> None:
+        """核心回归：leash 决定远处可见资源能否成为采集目标。
+
+        工人距目标 > 3 格（不触发就近豁免），因此完全由 leash 决定去不去。
+        """
+
+        far_resource = (46, 0)
+        outcomes = {}
+        for leash in (38, 56):
+            memory = TacticMemory(mode=MODE_DEVELOP)
+            memory.resource_leash_distance = leash
+            turn, _ = make_turn(
+                tick=30,
+                own_core=core((0, 0)),
+                units=(worker(WORKER_LOW, (20, 0)),),
+                resource_cells=(far_resource,),
+            )
+            summary = SmartTactic(memory).choose_actions(turn)
+            goal = memory.worker_goals.get(str(WORKER_LOW))
+            outcomes[leash] = (goal, summary.decisions)
+
+        # 46 格 > 38：被 leash 剔除，工人转去探索
+        goal_38, decisions_38 = outcomes[38]
+        self.assertTrue(
+            any("resource_leash_trimmed" in item for item in decisions_38),
+            f"38 格 leash 应剔除 46 格资源, 实际: {decisions_38}",
+        )
+        self.assertNotEqual(
+            goal_38.position if goal_38 else None,
+            far_resource,
+            "被 leash 剔除后不应把远矿设为目标",
+        )
+        # 46 格 < 56：放行，工人前往采集
+        goal_56, _ = outcomes[56]
+        self.assertIsNotNone(goal_56)
+        self.assertEqual(goal_56.kind, "visible_resource")
+        self.assertEqual(goal_56.position, far_resource)
+
+    def test_resource_leash_zero_disables_limit(self) -> None:
+        far_resource = (80, 0)
+        memory = TacticMemory(mode=MODE_DEVELOP)
+        memory.resource_leash_distance = 0
+        turn, _ = make_turn(
+            tick=30,
+            own_core=core((0, 0)),
+            units=(worker(WORKER_LOW, (40, 0)),),
+            resource_cells=(far_resource,),
+        )
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertFalse(
+            any("resource_leash_trimmed" in item for item in summary.decisions)
+        )
+        goal = memory.worker_goals.get(str(WORKER_LOW))
+        self.assertIsNotNone(goal)
+        self.assertEqual(goal.position, far_resource)
+
+    def test_browser_scout_limit_controls_dispatched_workers(self) -> None:
+        hints = [[6, 0], [0, 6], [-6, 0]]
+        assigned_counts = {}
+        for limit in (1, 3):
+            with TemporaryDirectory() as directory:
+                intel_path = Path(directory) / "browser-intel.json"
+                self._write_intel(intel_path, hints)
+                previous = os.environ.get("ARENA_HERO_BROWSER_INTEL_FILE")
+                os.environ["ARENA_HERO_BROWSER_INTEL_FILE"] = str(intel_path)
+                try:
+                    memory = TacticMemory(mode=MODE_DEVELOP)
+                    memory.browser_scout_limit = limit
+                    turn, _ = make_turn(
+                        tick=30,
+                        own_core=core((0, 0)),
+                        units=(
+                            worker(WORKER_LOW, (2, 1)),
+                            worker(WORKER_HIGH, (1, 2)),
+                            worker(WORKER_THIRD, (-2, 1)),
+                            worker(WORKER_FOURTH, (-1, 2)),
+                        ),
+                    )
+                    SmartTactic(memory).choose_actions(turn)
+                finally:
+                    if previous is None:
+                        os.environ.pop("ARENA_HERO_BROWSER_INTEL_FILE", None)
+                    else:
+                        os.environ["ARENA_HERO_BROWSER_INTEL_FILE"] = previous
+            assigned_counts[limit] = sum(
+                1
+                for goal in memory.worker_goals.values()
+                if goal.kind == "browser_resource_hint"
+            )
+
+        self.assertEqual(assigned_counts[1], 1, "默认只派 1 名探子")
+        self.assertGreater(
+            assigned_counts[3],
+            assigned_counts[1],
+            "提高上限后应派出更多工人验证提示",
+        )
+
     def test_distant_browser_resource_hint_yields_to_local_search(self) -> None:
         with TemporaryDirectory() as directory:
             intel_path = Path(directory) / "browser-intel.json"

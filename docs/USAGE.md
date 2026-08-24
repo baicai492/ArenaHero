@@ -225,6 +225,8 @@ python arena_hero_route_overlay_server.py --port 8765
 | `composition_vanguards` | non-negative integer | 阶梯第一级的先锋配比，默认 4 |
 | `composition_rangers` | non-negative integer | 阶梯第一级的游侠配比，默认 4 |
 | `browser_hint_distance` | non-negative integer | 浏览器水晶提示的搜索半径（格），默认 32；0 关闭提示。提示来自客户端已探索缓存里标记 `RESOURCE` 的格，含工人已离开视野的水晶；实测近处水晶多在 40~70 格，默认 32 常常用不上 |
+| `browser_scout_limit` | non-negative integer | 每 Tick 最多派几名工人验证提示，默认 1；0 不派人 |
+| `resource_leash_distance` | non-negative integer | develop 模式采集目标距 Core 的上限（格），默认 38；0 取消上限。必须 ≥ `browser_hint_distance`，否则中间那段是「能发现但采不到」的死区 |
 
 后四个字段与两个囤积开关只影响 `develop` 模式，详见 [STRATEGY.md](STRATEGY.md) 的「`develop` 目标编制阶梯与资源囤积」。注意阶梯或囤积生效期间会押后自动抢信标。
 

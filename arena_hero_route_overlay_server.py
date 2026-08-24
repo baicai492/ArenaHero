@@ -23,6 +23,8 @@ CONTROL_NUMBER_DEFAULTS = {
     "composition_vanguards": 4,
     "composition_rangers": 4,
     "browser_hint_distance": 32,
+    "browser_scout_limit": 1,
+    "resource_leash_distance": 38,
 }
 CONTROL_FLAG_DEFAULTS = {
     "raid_enabled": False,
@@ -63,6 +65,9 @@ EMPTY_STATS = {
     "composition_vanguards": 4,
     "composition_rangers": 4,
     "browser_hint_distance": 32,
+    "browser_scout_limit": 1,
+    "resource_leash_distance": 38,
+    "browser_hints_beyond_leash": 0,
     "effective_target_population": 20,
     "effective_workers": 12,
     "effective_vanguards": 4,

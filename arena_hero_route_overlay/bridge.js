@@ -132,6 +132,8 @@
       "composition_vanguards",
       "composition_rangers",
       "browser_hint_distance",
+      "browser_scout_limit",
+      "resource_leash_distance",
     ]) {
       if (typeof payload[key] === "number" && Number.isFinite(payload[key])) {
         update[key] = payload[key];

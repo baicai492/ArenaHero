@@ -18,5 +18,7 @@
   "composition_workers": 12,
   "composition_vanguards": 4,
   "composition_rangers": 4,
-  "browser_hint_distance": 32
+  "browser_hint_distance": 32,
+  "browser_scout_limit": 1,
+  "resource_leash_distance": 38
 }

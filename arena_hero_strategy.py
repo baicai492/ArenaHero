@@ -147,7 +147,12 @@ DEVELOP_LOCAL_RECALL_RADIUS = 120
 # A visible resource can still be a poor economic target when it was revealed
 # by a distant scout.  Keep new Develop-mode assignments inside the same local
 # production radius unless a Worker is already close enough to finish it.
-DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE = 38
+# 2026-08-24 改为控制文件 resource_leash_distance 的默认值，可在叠加层面板调整。
+# 注意它与 browser_hint_distance 会形成"死区"：提示半径大于本值时，中间那一段
+# 的水晶能被发现并派工人过去，但工人走到、格子进入视野变成可见资源后，会立刻
+# 被本 leash 从采集候选里剔除（除非已走到 3 格内），整趟白跑。
+DEFAULT_RESOURCE_LEASH_DISTANCE = 38
+DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE = DEFAULT_RESOURCE_LEASH_DISTANCE
 # Economy recovery in Aggress mode must find the next dynamic-node refill,
 # not send every Worker on a one-minute cross-map expedition.  Keep the sweep
 # inside the local production area and let remembered productive chunks win.
@@ -463,7 +468,11 @@ BROWSER_RESOURCE_REQUIRE_QUOTA_PLAUSIBILITY = True
 # 否决，连近处真实的水晶一起丢掉。
 DEFAULT_BROWSER_HINT_DISTANCE = 32
 BROWSER_RESOURCE_HINT_MAX_DISTANCE = DEFAULT_BROWSER_HINT_DISTANCE
-BROWSER_RESOURCE_SCOUT_LIMIT = 1
+# 每 Tick 最多派几名工人去验证浏览器提示。提示是低可信线索，默认只派 1 名探子，
+# 其余工人保持近处采集编队。提示较多时可调高，代价是更多工人离开采集区。
+# 2026-08-24 改为控制文件 browser_scout_limit 的默认值。
+DEFAULT_BROWSER_SCOUT_LIMIT = 1
+BROWSER_RESOURCE_SCOUT_LIMIT = DEFAULT_BROWSER_SCOUT_LIMIT
 CORE_LOGISTICS_CORRIDOR_LENGTH = 3
 MIGRATION_SITE_RADIUS = 3
 MIGRATION_SITE_TOTAL_ATTACK_CELLS = 24
@@ -793,6 +802,10 @@ class TacticMemory:
     composition_rangers: int = DEFAULT_COMPOSITION_RANGERS
     # 2026-08-24 浏览器水晶提示的搜索半径（control 配置），0 表示不使用提示。
     browser_hint_distance: int = DEFAULT_BROWSER_HINT_DISTANCE
+    # 2026-08-24 每 Tick 最多派几名工人验证浏览器提示（control 配置）。
+    browser_scout_limit: int = DEFAULT_BROWSER_SCOUT_LIMIT
+    # 2026-08-24 采集目标距 Core 的上限（control 配置）；已走到矿点 3 格内的工人例外。
+    resource_leash_distance: int = DEFAULT_RESOURCE_LEASH_DISTANCE
     unit_label_mapping: dict[str, str] = field(default_factory=dict)
     last_events: list[dict] = field(default_factory=list)
     unit_positions_for_overlay: dict[str, Position] = field(default_factory=dict)
@@ -2054,6 +2067,8 @@ class TacticMemory:
                 "composition_vanguards",
                 "composition_rangers",
                 "browser_hint_distance",
+                "browser_scout_limit",
+                "resource_leash_distance",
             ):
                 raw_value = data.get(key)
                 if isinstance(raw_value, (int, float)) and not isinstance(
@@ -2321,6 +2336,20 @@ class TacticMemory:
                 "composition_vanguards": self.composition_vanguards,
                 "composition_rangers": self.composition_rangers,
                 "browser_hint_distance": self.browser_hint_distance,
+                "browser_scout_limit": self.browser_scout_limit,
+                "resource_leash_distance": self.resource_leash_distance,
+                # 死区诊断：提示能发现、但走到后会被采集 leash 剔除的坐标数。
+                # 面板 tooltip 直接显示它，方便一眼看出两个半径的配置矛盾。
+                "browser_hints_beyond_leash": (
+                    sum(
+                        1
+                        for position in self.browser_resource_hints
+                        if _distance(turn.core.position, position)
+                        >= self.resource_leash_distance
+                    )
+                    if turn.core is not None and self.resource_leash_distance > 0
+                    else 0
+                ),
                 "effective_target_population": _effective_target_population(
                     self, len(turn.units)
                 ),
@@ -4258,8 +4287,9 @@ class SmartTactic:
                     RECOVERY_RESOURCE_TARGET_CORE_LEASH_DISTANCE
                 )
             elif self.memory.mode == MODE_DEVELOP:
+                # 控制文件可调；0 表示取消 develop 的采集距离上限。
                 resource_target_core_leash = (
-                    DEVELOP_RESOURCE_TARGET_CORE_LEASH_DISTANCE
+                    self.memory.resource_leash_distance or None
                 )
             elif self.memory.mode == MODE_AGGRESS:
                 resource_target_core_leash = (
@@ -4640,7 +4670,7 @@ class SmartTactic:
             self.memory.mode == MODE_AGGRESS
             and self.memory.browser_resource_hints
         ):
-            reserved_scout_tasks += BROWSER_RESOURCE_SCOUT_LIMIT
+            reserved_scout_tasks += self.memory.browser_scout_limit
         productive_worker_slots = exact_resource_tasks + reserved_scout_tasks
         resource_sweep_active = (
             self.memory.mode in {MODE_AGGRESS, MODE_BEACON}
@@ -4926,7 +4956,8 @@ class SmartTactic:
                 and _distance(turn.core.position, position) <= browser_hint_distance
                 and not _currently_visible(turn, position, self.memory.known_obstacles)
             }
-            # 远程提示只派一个试探工人，其余工人保持本地搜索和采集编队。
+            # 提示是低可信线索，默认只派 1 名探子，其余工人保持本地搜索和采集
+            # 编队；browser_scout_limit 可在面板调高。
             browser_workers = sorted(
                 unassigned.values(),
                 key=lambda worker: (
@@ -4936,7 +4967,7 @@ class SmartTactic:
                     ),
                     worker.id.bytes,
                 ),
-            )[:BROWSER_RESOURCE_SCOUT_LIMIT]
+            )[: self.memory.browser_scout_limit]
             browser_unassigned = {
                 worker.id: worker
                 for worker in browser_workers

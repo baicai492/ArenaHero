@@ -22,6 +22,8 @@
     composition_vanguards: 4,
     composition_rangers: 4,
     browser_hint_distance: 32,
+    browser_scout_limit: 1,
+    resource_leash_distance: 38,
   };
   const CONTROL_FLAG_DEFAULTS = {
     raid_enabled: false,
@@ -404,7 +406,56 @@
     const online = stats.browser_intel_online
       ? `抓取在线（${stats.browser_intel_age_seconds ?? "?"} 秒前）`
       : `抓取离线（数据 ${stats.browser_intel_age_seconds ?? "?"} 秒前，超过 12 秒即失效）`;
-    return `\n当前生效：${online}，采纳 ${stats.browser_resource_hints} 个提示`;
+    return `\n当前生效：${online}，采纳 ${stats.browser_resource_hints} 个提示${deadZoneText()}`;
+  }
+
+  // 死区提醒：提示半径大于采集 leash 时，中间那段的水晶发现了也采不到。
+  function deadZoneText() {
+    const stats = state.stats;
+    if (!stats) {
+      return "";
+    }
+    const hint = stats.browser_hint_distance;
+    const leash = stats.resource_leash_distance;
+    const beyond = stats.browser_hints_beyond_leash;
+    if (typeof hint !== "number" || typeof leash !== "number" || leash <= 0) {
+      return "";
+    }
+    if (hint <= leash) {
+      return `\n搜索 ${hint} ≤ 采集 ${leash}，无死区`;
+    }
+    const suffix =
+      typeof beyond === "number" && beyond > 0
+        ? `，当前有 ${beyond} 个提示落在死区（发现了也采不到）`
+        : "，当前没有提示落在死区";
+    return `\n⚠ 死区 ${leash}~${hint} 格：搜索 ${hint} > 采集 ${leash}${suffix}`;
+  }
+
+  // 本局累计被采集 leash 剔除的远矿数，用来判断当前上限是不是压得太狠。
+  function leashTrimStatusText() {
+    const totals = state.stats && state.stats.decision_totals;
+    if (!totals || typeof totals !== "object") {
+      return "";
+    }
+    const trimmed = totals["resource:develop_leash_trimmed"];
+    if (typeof trimmed !== "number" || trimmed <= 0) {
+      return "";
+    }
+    return `\n本局累计剔除 ${trimmed} 个超距资源（若近处已无矿，说明可以放宽）`;
+  }
+
+  function browserScoutStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.browser_resource_hints !== "number") {
+      return "";
+    }
+    const totals = stats.decision_totals;
+    const assigned =
+      totals && typeof totals["worker:browser_resource_hint"] === "number"
+        ? totals["worker:browser_resource_hint"]
+        : null;
+    const tail = assigned === null ? "" : `，本局累计派工 ${assigned} 次`;
+    return `\n当前生效：待验证提示 ${stats.browser_resource_hints} 个${tail}`;
   }
 
   function createLocatorPanel() {
@@ -746,6 +797,31 @@
         "\n配套约束：采集目标本身还受 38 格 leash 限制，但已走到矿点 3 格内的工人可以采完。" +
         browserHintStatusText(),
       { maximum: 200, step: 4 },
+    );
+    addControlNumber(
+      panel,
+      "resource_leash_distance",
+      "采集目标最大距离",
+      () =>
+        "【develop 发育模式】距 Core 超过此距离的资源不会被设为采集目标，默认 38 格；0 = 取消上限。" +
+        "\n已走到矿点 3 格内的工人不受限制，允许把远矿采完。" +
+        "\n这道限制作用在「格子进入视野、变成可见资源」之后：工人可以被派去更远的提示，但走到后目标会被撤销，整趟白跑。" +
+        "\n所以它必须 ≥「水晶提示搜索距离」，否则中间那段就是死区。" +
+        "\n代价：52 格单程约 1.4 分钟，往返约 100 Tick，工人会从采矿变成跑腿；近处还有矿时不宜放太大。" +
+        deadZoneText() +
+        leashTrimStatusText(),
+      { maximum: 200, step: 4 },
+    );
+    addControlNumber(
+      panel,
+      "browser_scout_limit",
+      "提示验证工人数",
+      () =>
+        "每 Tick 最多派几名工人去验证水晶提示，默认 1 名；0 = 不派人验证。" +
+        "\n提示是低可信线索（曾经看到、可能已被采空），默认只派 1 名探子，其余工人保持近处采集编队。" +
+        "\n提示较多时调高能加快验证，代价是更多工人离开采集区。" +
+        browserScoutStatusText(),
+      { maximum: 12, step: 1 },
     );
 
     const ladderTitle = document.createElement("div");
