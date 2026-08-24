@@ -38,6 +38,7 @@ from arena_hero import (
     WaitAction,
     unit_cost,
 )
+from arena_hero.rules import core_resource_capacity
 
 from arena_hero_tactic import choose_actions
 from arena_hero_strategy import (
@@ -8762,6 +8763,98 @@ class CompositionLadderTests(unittest.TestCase):
             HOARD_STAGE2_RESOURCE_TARGET,
         )
 
+    def test_ladder_waits_for_hoard_before_advancing(self) -> None:
+        """回归：勾了本级囤积时，攒够水位才算这一级完成。
+
+        实测现场：12工5先5游=22人、资源 40，编制虽已达成但 95 没攒到，面板却
+        显示第二级「目标 30 人 · 18工 6先 6游」，与实际行为不符。用户设定的语义
+        是"人口达到 20 后优先将资源攒到 95"——攒资源是这一级的一部分。
+        """
+
+        memory = TacticMemory()
+        memory.hoard_stage1 = True
+        counts = (12, 5, 5)  # 第一级 12:4:4 已达成，游侠超产 1、先锋超产 1
+
+        # 水位未达成：停在第一级，并报出超产
+        for resources in (0, 40, HOARD_STAGE1_RESOURCE_TARGET - 1):
+            self.assertEqual(
+                _effective_composition(memory, *counts, resources),
+                (12, 4, 4),
+                f"资源 {resources} 未达水位，不得显示第二级",
+            )
+            self.assertEqual(_composition_overflow(memory, *counts, resources), 2)
+            self.assertEqual(
+                _effective_target_population(memory, *counts, resources),
+                22,
+                "目标人口 = 本级编制 20 + 超产 2",
+            )
+
+        # 水位达成 → 升第二级
+        for resources in (HOARD_STAGE1_RESOURCE_TARGET, 110):
+            self.assertEqual(
+                _effective_composition(memory, *counts, resources),
+                (
+                    COMPOSITION_STAGE2_WORKERS,
+                    COMPOSITION_STAGE2_VANGUARDS,
+                    COMPOSITION_STAGE2_RANGERS,
+                ),
+            )
+            self.assertEqual(_composition_overflow(memory, *counts, resources), 0)
+
+    def test_ladder_advances_without_hoard_switch(self) -> None:
+        """未勾囤积时没有水位可等，编制达成即升级（否则阶梯会永久停在第一级）。"""
+
+        memory = TacticMemory()
+        self.assertFalse(memory.hoard_stage1)
+        counts = (12, 5, 5)
+        stage2 = (
+            COMPOSITION_STAGE2_WORKERS,
+            COMPOSITION_STAGE2_VANGUARDS,
+            COMPOSITION_STAGE2_RANGERS,
+        )
+        for resources in (0, 40, 200):
+            self.assertEqual(
+                _effective_composition(memory, *counts, resources), stage2
+            )
+
+    def test_stage_two_also_waits_for_its_hoard(self) -> None:
+        """第二档囤积同理：18:6:6 达成后要攒到 150 才进终态。"""
+
+        memory = TacticMemory()
+        memory.hoard_stage1 = True
+        memory.hoard_stage2 = True
+        counts = (18, 6, 6)
+        stage2 = (
+            COMPOSITION_STAGE2_WORKERS,
+            COMPOSITION_STAGE2_VANGUARDS,
+            COMPOSITION_STAGE2_RANGERS,
+        )
+        self.assertEqual(
+            _effective_composition(
+                memory, *counts, HOARD_STAGE2_RESOURCE_TARGET - 1
+            ),
+            stage2,
+            "150 未攒够，仍停在第二级",
+        )
+        self.assertIsNone(
+            _effective_composition(memory, *counts, HOARD_STAGE2_RESOURCE_TARGET),
+            "攒够 150 后进入终态，回落项目默认比例",
+        )
+
+    def test_ladder_omitting_resources_ignores_hoard_gate(self) -> None:
+        """不传 resources 时退化为纯编制判定，供不关心库存的调用方使用。"""
+
+        memory = TacticMemory()
+        memory.hoard_stage1 = True
+        self.assertEqual(
+            _effective_composition(memory, 12, 4, 4),
+            (
+                COMPOSITION_STAGE2_WORKERS,
+                COMPOSITION_STAGE2_VANGUARDS,
+                COMPOSITION_STAGE2_RANGERS,
+            ),
+        )
+
     def test_ladder_disabled_by_zero_and_outside_develop(self) -> None:
         memory = TacticMemory()
         memory.target_population = 0
@@ -9006,6 +9099,123 @@ class ResourceHoardTests(unittest.TestCase):
             rangers=6,
         )
         self.assertIsInstance(released, SpawnAction)
+
+    def test_strict_water_line_requires_target_plus_cost(self) -> None:
+        """回归：容量够时水位是产兵后的真下限，不是"到 95 就开始花"。
+
+        用户实测 92/115（人口 23）时希望继续攒到 102 再产工人。容量 115 能同时
+        容纳水位 95 与最贵的游侠 16，因此每个兵种都要攒到 `95 + 该兵种成本`。
+        """
+
+        # 13工5先5游 = 23 人，目标 18:6:6，容量 115
+        roster = (13, 5, 5)
+        population = sum(roster)
+        self.assertEqual(core_resource_capacity(population), 115)
+        worker_cost = unit_cost(UnitType.WORKER, population)
+        vanguard_cost = unit_cost(UnitType.VANGUARD, population)
+        ranger_cost = unit_cost(UnitType.RANGER, population)
+        target = HOARD_STAGE1_RESOURCE_TARGET
+
+        # 攒到水位也不够：还差该单位的成本
+        for resources in (target, target + worker_cost - 1):
+            self.assertNotIsInstance(
+                self._spawn_for(
+                    resources=resources,
+                    control={"mode": "develop", "hoard_stage1": True},
+                    workers=roster[0],
+                    vanguards=roster[1],
+                    rangers=roster[2],
+                ),
+                SpawnAction,
+                f"资源 {resources} 不足 水位+成本，不应产兵",
+            )
+
+        # 攒到 水位+工人成本 → 放行工人
+        action = self._spawn_for(
+            resources=target + worker_cost,
+            control={"mode": "develop", "hoard_stage1": True},
+            workers=roster[0],
+            vanguards=roster[1],
+            rangers=roster[2],
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.WORKER)
+
+        # 攒到 水位+先锋成本 → 按阶梯顺序优先补先锋
+        action = self._spawn_for(
+            resources=target + vanguard_cost,
+            control={"mode": "develop", "hoard_stage1": True},
+            workers=roster[0],
+            vanguards=roster[1],
+            rangers=roster[2],
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.VANGUARD)
+        # 产完仍不跌破水位
+        self.assertGreaterEqual(target + vanguard_cost - vanguard_cost, target)
+        self.assertLess(ranger_cost + target, core_resource_capacity(population) + 1)
+
+    def test_strict_mode_falls_back_when_capacity_too_small(self) -> None:
+        """容量装不下 水位+最贵单位 时退回解锁阈值，否则会永久停产。
+
+        人口 20 容量仅 100，水位 95 + 游侠 16 = 111 装不下；若坚持严格下限，
+        预算最多 5，连工人都买不起，人口永久卡死。
+        """
+
+        population = 20
+        self.assertEqual(core_resource_capacity(population), 100)
+        self.assertLess(
+            core_resource_capacity(population),
+            HOARD_STAGE1_RESOURCE_TARGET + unit_cost(UnitType.RANGER, population),
+        )
+        # 攒到水位即放行（旧的解锁阈值语义）
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET,
+            control={"mode": "develop", "hoard_stage1": True},
+            workers=12,
+            vanguards=4,
+            rangers=4,
+        )
+        self.assertIsInstance(action, SpawnAction)
+
+    def test_ladder_gap_waits_instead_of_overproducing(self) -> None:
+        """回归：缺的兵种买不起时等着，不产已达标兵种的多余单位。
+
+        18工5先6游、目标 18:6:6 时只差 1 名先锋。continuous_growth_spawn 的 0.20
+        比压容差本意是"最缺的暂时买不起就先产下一种"，在囤积期间反而把刚攒起来
+        的资源花在第 19 个工人上，还多出一个超产单位。
+        """
+
+        population = 29
+        vanguard_cost = unit_cost(UnitType.VANGUARD, population)
+        worker_cost = unit_cost(UnitType.WORKER, population)
+        target = HOARD_STAGE1_RESOURCE_TARGET
+
+        # 够买工人但不够买先锋 → 应等待，不产工人
+        resources = target + worker_cost
+        self.assertLess(resources, target + vanguard_cost)
+        self.assertNotIsInstance(
+            self._spawn_for(
+                resources=resources,
+                control={"mode": "develop", "hoard_stage1": True},
+                workers=18,
+                vanguards=5,
+                rangers=6,
+            ),
+            SpawnAction,
+            "编制有缺口时不应产已达标兵种的多余单位",
+        )
+
+        # 够买先锋 → 补上缺口
+        action = self._spawn_for(
+            resources=target + vanguard_cost,
+            control={"mode": "develop", "hoard_stage1": True},
+            workers=18,
+            vanguards=5,
+            rangers=6,
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.VANGUARD)
 
     def test_aggress_mode_ignores_hoard(self) -> None:
         action = self._spawn_for(

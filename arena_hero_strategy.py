@@ -646,7 +646,11 @@ def _composition_met(
 
 
 def _ladder_composition(
-    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+    memory: "TacticMemory",
+    workers: int,
+    vanguards: int,
+    rangers: int,
+    resources: int | None = None,
 ) -> tuple[int, int, int] | None:
     """返回当前所处阶梯级别的 (工人, 先锋, 游侠) 目标；None 表示阶梯已用尽。
 
@@ -654,6 +658,10 @@ def _ladder_composition(
     会把阶梯提前推到下一级，被挤掉的缺口永远补不上：12:4:4 配置下多产 1 个游侠
     时人口 20 是 11工4先5游，按人口判定会直接进第二级并同时启动囤积，第 12 个
     工人再也补不上。按编制判定则第一级仍未达成，工人补到 12（总人口 21）后才升级。
+
+    resources 给出当前库存时，本级的囤积水位也算作升级条件的一部分：用户勾选
+    "人口达到 20 后优先将资源攒到 95"的语义是这一级包含攒资源，攒够才进下一级。
+    否则编制刚达成、资源还只有 40 时面板就显示第二级目标，与实际行为不符。
     """
 
     if not _composition_ladder_enabled(memory):
@@ -669,6 +677,12 @@ def _ladder_composition(
     )
     if not _composition_met(counts, stage1):
         return stage1
+    if (
+        resources is not None
+        and memory.hoard_stage1
+        and resources < HOARD_STAGE1_RESOURCE_TARGET
+    ):
+        return stage1
     stage2 = (
         COMPOSITION_STAGE2_WORKERS,
         COMPOSITION_STAGE2_VANGUARDS,
@@ -676,11 +690,21 @@ def _ladder_composition(
     )
     if not _composition_met(counts, stage2):
         return stage2
+    if (
+        resources is not None
+        and memory.hoard_stage2
+        and resources < HOARD_STAGE2_RESOURCE_TARGET
+    ):
+        return stage2
     return None
 
 
 def _composition_overflow(
-    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+    memory: "TacticMemory",
+    workers: int,
+    vanguards: int,
+    rangers: int,
+    resources: int | None = None,
 ) -> int:
     """相对当前阶梯级别目标的超产数量。
 
@@ -690,7 +714,7 @@ def _composition_overflow(
     门槛顺移到 40，第二档永远不触发。
     """
 
-    target = _ladder_composition(memory, workers, vanguards, rangers)
+    target = _ladder_composition(memory, workers, vanguards, rangers, resources)
     if target is None:
         return 0
     return sum(
@@ -735,30 +759,41 @@ def _composition_ladder_enabled(memory: "TacticMemory") -> bool:
 
 
 def _effective_target_population(
-    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+    memory: "TacticMemory",
+    workers: int,
+    vanguards: int,
+    rangers: int,
+    resources: int | None = None,
 ) -> int:
     """返回当前生效的目标人口；0 表示已进入不限人口的连续增长。
 
     等于当前级编制之和加上超产量——超产的单位不会被裁掉，所以实际会长到这个数。
     """
 
-    target = _ladder_composition(memory, workers, vanguards, rangers)
+    target = _ladder_composition(memory, workers, vanguards, rangers, resources)
     if target is None:
         return 0
-    return sum(target) + _composition_overflow(memory, workers, vanguards, rangers)
+    return sum(target) + _composition_overflow(
+        memory, workers, vanguards, rangers, resources
+    )
 
 
 def _effective_composition(
-    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+    memory: "TacticMemory",
+    workers: int,
+    vanguards: int,
+    rangers: int,
+    resources: int | None = None,
 ) -> tuple[int, int, int] | None:
     """返回当前阶梯级别的 (工人, 先锋, 游侠) 目标编制。
 
-    阶梯第一级由控制文件配置（默认 20 人 12:4:4），三个兵种都达标后升到第二级
-    30 人 18:6:6；两级都达标后返回 None，由调用方回落各模式的项目默认编制。目标
-    人口或配比合计设为 0，以及非 develop 模式，同样返回 None。
+    阶梯第一级由控制文件配置（默认 20 人 12:4:4），三个兵种都达标、且本级囤积
+    水位（若已勾选）攒够后才升到第二级 30 人 18:6:6；两级都走完后返回 None，由
+    调用方回落各模式的项目默认编制。目标人口或配比合计设为 0，以及非 develop
+    模式，同样返回 None。
     """
 
-    return _ladder_composition(memory, workers, vanguards, rangers)
+    return _ladder_composition(memory, workers, vanguards, rangers, resources)
 
 
 def _split_population(
@@ -784,7 +819,11 @@ def _split_population(
 
 
 def _effective_growth_profile(
-    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+    memory: "TacticMemory",
+    workers: int,
+    vanguards: int,
+    rangers: int,
+    resources: int | None = None,
 ) -> tuple[tuple[UnitType, int], ...]:
     """返回连续增长的 (兵种, 权重) 序列；阶梯用尽后沿用默认 5:4:6。
 
@@ -792,7 +831,9 @@ def _effective_growth_profile(
     偏向战斗兵；权重 0 的兵种被排除，因此 12:4:0 表示不再产游侠。
     """
 
-    composition = _effective_composition(memory, workers, vanguards, rangers)
+    composition = _effective_composition(
+        memory, workers, vanguards, rangers, resources
+    )
     if composition is None:
         return CONTINUOUS_GROWTH_PROFILE
     workers, vanguards, rangers = composition
@@ -2340,10 +2381,13 @@ class TacticMemory:
                 else 0
             )
             # 阶梯用尽时回落项目默认编制，让面板 tooltip 显示实际生效的目标。
+            # 传入当前库存：勾了本级囤积但还没攒够时，阶梯仍停在本级，面板不该
+            # 提前显示下一级的目标。
             stats_counts = (
                 len(turn.workers),
                 len(turn.vanguards),
                 len(turn.rangers),
+                turn.resources,
             )
             stats_overflow = _composition_overflow(self, *stats_counts)
             effective_composition = _effective_composition(self, *stats_counts) or (
@@ -2393,6 +2437,14 @@ class TacticMemory:
                 "hoard_stage2": self.hoard_stage2,
                 "hoard_target": _hoard_resource_target(
                     self, len(turn.units), stats_overflow
+                ),
+                # 严格模式：容量能同时容纳水位与最贵单位时，水位是产兵后的真下限
+                # （需攒到 水位+成本）；否则退回"攒到水位放行一次"的解锁阈值。
+                "hoard_strict": bool(
+                    _hoard_resource_target(self, len(turn.units), stats_overflow) > 0
+                    and turn.resource_capacity
+                    >= _hoard_resource_target(self, len(turn.units), stats_overflow)
+                    + unit_cost(UnitType.RANGER, len(turn.units))
                 ),
                 "target_population": self.target_population,
                 "composition_workers": self.composition_workers,
@@ -6502,6 +6554,7 @@ class SmartTactic:
             len(turn.workers),
             len(turn.vanguards),
             len(turn.rangers),
+            turn.resources,
         )
         if (
             _effective_target_population(self.memory, *expedition_counts) > 0
@@ -10951,12 +11004,13 @@ class SmartTactic:
         )
         shield_cap = 10 if owns_beacon else 5
         reserve = 2 if near_threat or core.shield < shield_cap else 0
-        budget = projected_resources - reserve
         # 超产量：多产出来的单位当不存在，把阶梯与囤积的人口门槛整体顺移，让被
-        # 挤掉的编制缺口先补齐（详见 _composition_overflow）。
+        # 挤掉的编制缺口先补齐（详见 _composition_overflow）。传入 projected_resources
+        # 与 hoard_block 用同一份口径：勾了本级囤积但还没攒够时，阶梯停在本级。
         composition_overflow = _composition_overflow(
-            self.memory, workers, vanguards, rangers
-        )        # 2026-08-24 资源囤积（仅 develop）：水位是产兵的解锁阈值，不是产兵后的下限。
+            self.memory, workers, vanguards, rangers, projected_resources
+        )
+        # 2026-08-24 资源囤积（仅 develop）：水位是产兵的解锁阈值，不是产兵后的下限。
         # 仓库容量 = max(10, 人口 × 5)，人口 20 只有 100、人口 30 只有 150，若要求
         # 产兵后仍不跌破 95 / 150，则连一个工人都买不起，人口会永久卡死。因此改为
         # 攒到水位才放行一次产兵，花掉后重新攒回水位，常态维持接近满仓的库存。
@@ -10965,18 +11019,30 @@ class SmartTactic:
         hoard_target = _hoard_resource_target(
             self.memory, current_population, composition_overflow
         )
-        hoard_block = (
-            hoard_target > 0
-            and projected_resources < hoard_target
-            and not (
-                near_threat
-                or recovery_active
-                or home_vanguard_shortfall > 0
-                or home_ranger_shortfall > 0
-                or combat_shortfall > 0
-                or workers < AGGRESS_BASE_WORKERS
-            )
+        hoard_override = (
+            near_threat
+            or recovery_active
+            or home_vanguard_shortfall > 0
+            or home_ranger_shortfall > 0
+            or combat_shortfall > 0
+            or workers < AGGRESS_BASE_WORKERS
         )
+        # 2026-08-24 容量够时把水位当成真正的下限：必须攒到"水位 + 该单位成本"才
+        # 产兵，产完仍不跌破水位；而不是一到水位就放行、花完再攒回来（用户实测
+        # 92/115 时希望继续攒到 102 再产工人）。实现方式是把水位并入 reserve，于是
+        # 每个 `budget >= cost` 天然等价于 `资源 >= 水位 + 成本`。
+        # 只有容量能同时容纳水位和最贵的单位时才启用严格模式，否则预算会被扣到
+        # 买不起任何单位而永久停产（人口 20 容量仅 100，水位 95 + 游侠 16 = 111
+        # 就装不下），此时退回"攒到水位放行一次"的解锁阈值语义。
+        hoard_reserve = 0
+        hoard_block = False
+        if hoard_target > 0 and not hoard_override:
+            dearest_cost = max(worker_cost, vanguard_cost, ranger_cost)
+            if turn.resource_capacity >= hoard_target + dearest_cost:
+                hoard_reserve = hoard_target
+            else:
+                hoard_block = projected_resources < hoard_target
+        budget = projected_resources - reserve - hoard_reserve
         mode = self.memory.mode
         recall = self.memory.recall
         # 2026-08-24 阶梯配比在 recall 之前算好。手动召回只是收兵回防，编制意图
@@ -10986,7 +11052,7 @@ class SmartTactic:
         # 违背了面板设定。灾后重建（recovery_active）仍保持默认比例：那是真灾难，
         # 生存优先于编制意图。
         develop_growth_profile = _effective_growth_profile(
-            self.memory, workers, vanguards, rangers
+            self.memory, workers, vanguards, rangers, projected_resources
         )
         known_core_target = (
             self._pick_enemy_core_target(turn)
@@ -11133,7 +11199,7 @@ class SmartTactic:
             # 12 工人（即 12:4:5 = 21 人）。每级内部顺序与原策略一致：先锋 → 游侠
             # → 工人。第一级只比原编制少 1 名游侠，让总数正好卡在涨价档前。
             composition = _effective_composition(
-                self.memory, workers, vanguards, rangers
+                self.memory, workers, vanguards, rangers, projected_resources
             )
             vanguard_target = (
                 composition[1]
@@ -11160,6 +11226,17 @@ class SmartTactic:
                 >= DEFENSE_REPLACEMENT_RESERVE
             ):
                 return UnitType.WORKER
+            # 2026-08-24 阶梯还有缺口但缺的兵种买不起时就等着，不产已达标兵种的
+            # 多余单位。continuous_growth_spawn 的 0.20 比压容差本意是"最缺的兵种
+            # 暂时买不起就先产下一种"，在囤积期间反而有害：18工5先6游、资源 107
+            # 时先锋差 1 却买不起（需 95+13=108），容差会放行第 19 个工人，把刚
+            # 攒起来的资源花掉、还多出一个超产单位。
+            if composition is not None and (
+                vanguards < vanguard_target
+                or rangers < ranger_target
+                or workers < worker_target
+            ):
+                return None
             return continuous_growth_spawn(develop_growth_profile)
 
         if mode == MODE_AGGRESS:

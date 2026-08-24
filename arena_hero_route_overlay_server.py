@@ -60,6 +60,7 @@ EMPTY_STATS = {
     "hoard_stage1": False,
     "hoard_stage2": False,
     "hoard_target": 0,
+    "hoard_strict": False,
     "target_population": 20,
     "composition_workers": 12,
     "composition_vanguards": 4,

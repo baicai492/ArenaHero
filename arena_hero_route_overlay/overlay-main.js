@@ -399,7 +399,10 @@
     if (stats.hoard_target <= 0) {
       return `\n当前生效：未在囤积（人口 ${stats.population ?? "?"} 未达门槛、本档未开启，或非发育模式）`;
     }
-    return `\n当前生效：囤积目标 ${stats.hoard_target} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}`;
+    const mode = stats.hoard_strict
+      ? "严格下限：需攒到 水位+该单位成本，产完仍不跌破水位"
+      : "解锁阈值：容量装不下 水位+最贵单位，攒到水位即放行一次";
+    return `\n当前生效：囤积目标 ${stats.hoard_target} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}\n${mode}`;
   }
 
   // 水晶提示的实时状态：抓取是否在线、当前采纳了几个提示。
