@@ -380,10 +380,15 @@
       typeof rangers === "number"
         ? `${workers}工 ${vanguards}先 ${rangers}游`
         : "?";
-    if (stats.effective_target_population <= 0) {
+    if ((stats.effective_target_population ?? 0) <= 0) {
       return `当前生效：人口不限制，按项目默认 5:4:6 连续增长（基础编制 ${composition}）`;
     }
-    return `当前生效：目标 ${stats.effective_target_population} 人 · ${composition}`;
+    const overflow = stats.composition_overflow;
+    const overflowText =
+      typeof overflow === "number" && overflow > 0
+        ? `（含超产 ${overflow}，多产的兵种不裁撤，缺口先补齐）`
+        : "";
+    return `当前生效：目标 ${stats.effective_target_population} 人 · ${composition}${overflowText}`;
   }
 
   function hoardStatusText() {
@@ -2362,6 +2367,25 @@
     }, "*");
   }
 
+  // 2026-08-24 后台标签页兜底：抓取原先只挂在 requestAnimationFrame 的渲染循环
+  // 里，而浏览器会把后台标签页的 rAF 降频到几乎停摆。实测切走后 intel 文件 127
+  // 秒没更新，策略端按 12 秒过期把整批提示丢弃，browser_resource_hints 归零。
+  // setInterval 在后台只被降频到 1 秒一次，足够维持 12 秒的新鲜度窗口。
+  function startBackgroundCapture() {
+    setInterval(() => {
+      if (typeof document !== "undefined" && !document.hidden) {
+        return; // 前台由渲染循环负责，避免重复抓取
+      }
+      const mapCanvas = state.mapCanvas && state.mapCanvas.isConnected
+        ? state.mapCanvas
+        : null;
+      if (!mapCanvas) {
+        return;
+      }
+      captureBrowserResources(performance.now(), mapCanvas);
+    }, 2000);
+  }
+
   function drawUnitLabels(context, width, height) {
     if (!state.settings.showUnitLabels) {
       return;
@@ -2888,4 +2912,5 @@
     state.pointer = null;
   });
   requestAnimationFrame(render);
+  startBackgroundCapture();
 })();

@@ -69,6 +69,7 @@ EMPTY_STATS = {
     "resource_leash_distance": 38,
     "browser_hints_beyond_leash": 0,
     "effective_target_population": 20,
+    "composition_overflow": 0,
     "effective_workers": 12,
     "effective_vanguards": 4,
     "effective_rangers": 4,

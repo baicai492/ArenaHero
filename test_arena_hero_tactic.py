@@ -97,6 +97,7 @@ from arena_hero_strategy import (
     WorkerGoal,
     _chunk_of,
     _chunk_quota,
+    _composition_overflow,
     _core_attack_surface_profile,
     _core_logistics_corridor,
     _distance,
@@ -3105,6 +3106,84 @@ class BalancedTacticTests(unittest.TestCase):
             assigned_counts[1],
             "提高上限后应派出更多工人验证提示",
         )
+
+    def test_browser_hint_overrides_exploration_goal(self) -> None:
+        """回归：守着探索目标的工人不得从 10 格外的已知水晶旁走过。
+
+        实测现场：提示 (-295,-78) 距工人 10 格，工人却保留上一 Tick 的
+        refilled_chunk 目标继续探图，而 70/86 格外的工人反被派去该提示。
+        """
+
+        # 提示必须在工人视野（半径 3）与 Core 视野（半径 5）之外，否则会被
+        # visible_absent 判定为"看得见且没有资源"而立即失效。
+        hint = (20, 0)
+        with TemporaryDirectory() as directory:
+            intel_path = Path(directory) / "browser-intel.json"
+            self._write_intel(intel_path, [list(hint)])
+            previous = os.environ.get("ARENA_HERO_BROWSER_INTEL_FILE")
+            os.environ["ARENA_HERO_BROWSER_INTEL_FILE"] = str(intel_path)
+            try:
+                memory = TacticMemory(
+                    mode=MODE_DEVELOP,
+                    # 工人距提示 10 格，却守着 40 格外的探索目标
+                    worker_goals={
+                        str(WORKER_LOW): WorkerGoal("refilled_chunk", (-30, 0), 5)
+                    },
+                )
+                turn, _ = make_turn(
+                    tick=30,
+                    own_core=core((0, 0)),
+                    units=(worker(WORKER_LOW, (10, 0)),),
+                )
+                SmartTactic(memory).choose_actions(turn)
+            finally:
+                if previous is None:
+                    os.environ.pop("ARENA_HERO_BROWSER_INTEL_FILE", None)
+                else:
+                    os.environ["ARENA_HERO_BROWSER_INTEL_FILE"] = previous
+
+        goal = memory.worker_goals.get(str(WORKER_LOW))
+        self.assertIsNotNone(goal)
+        self.assertEqual(goal.kind, "browser_resource_hint")
+        self.assertEqual(goal.position, hint)
+
+    def test_browser_hint_prefers_nearest_worker(self) -> None:
+        """回归：提示应配给离它最近的工人，而不是按全局最小距离排队。
+
+        旧写法按"工人到最近提示的距离"排序取前 N 名，只保证被选中的工人离
+        某个提示近；实测出现离目标 70 格的工人中选、10 格的落选。
+        """
+
+        # 两个提示都要在工人视野（半径 3）外，否则会被 visible_absent 立即失效
+        near_hint = (14, 0)
+        far_hint = (0, 44)
+        with TemporaryDirectory() as directory:
+            intel_path = Path(directory) / "browser-intel.json"
+            self._write_intel(intel_path, [list(near_hint), list(far_hint)])
+            previous = os.environ.get("ARENA_HERO_BROWSER_INTEL_FILE")
+            os.environ["ARENA_HERO_BROWSER_INTEL_FILE"] = str(intel_path)
+            try:
+                memory = TacticMemory(mode=MODE_DEVELOP)
+                memory.browser_scout_limit = 1
+                turn, _ = make_turn(
+                    tick=30,
+                    own_core=core((0, 0)),
+                    units=(
+                        worker(WORKER_LOW, (8, 0)),  # 距 near_hint 6 格
+                        worker(WORKER_HIGH, (0, 30)),  # 距 far_hint 14 格
+                    ),
+                )
+                SmartTactic(memory).choose_actions(turn)
+            finally:
+                if previous is None:
+                    os.environ.pop("ARENA_HERO_BROWSER_INTEL_FILE", None)
+                else:
+                    os.environ["ARENA_HERO_BROWSER_INTEL_FILE"] = previous
+
+        low_goal = memory.worker_goals.get(str(WORKER_LOW))
+        self.assertIsNotNone(low_goal, "最近的工人应中选")
+        self.assertEqual(low_goal.kind, "browser_resource_hint")
+        self.assertEqual(low_goal.position, near_hint)
 
     def test_distant_browser_resource_hint_yields_to_local_search(self) -> None:
         with TemporaryDirectory() as directory:
@@ -6177,7 +6256,89 @@ class ModeAndRecallTests(unittest.TestCase):
             )
         )
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.RANGER)
+        # 2026-08-24 召回期间也沿用面板配置的编制阶梯（默认 12:4:4）。
+        # 4工3先3游 下工人比压 4/12 最低，因此补工人；此前不传 profile 退回
+        # 默认 5:4:6，游侠比压最低而产游侠，违背面板设定。
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+
+    def test_recall_follows_ladder_composition(self) -> None:
+        """回归：手动召回不得让编制阶梯失效。
+
+        实测现场：control recall=true 时 _select_spawn 在 recall 分支就 return，
+        末尾调用 continuous_growth_spawn() 不传 profile，退回默认 5:4:6。
+        12:4:4 配置下 7工4先4游 时按 5:4:6 算游侠比压 4/6 最低，于是产出第 5 个
+        游侠（日志：Tick 161511 生产 游侠, 消耗 12 点资源），违背面板设定。
+        """
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            self._write_control(control_path, mode="develop", recall=True)
+            units = tuple(
+                worker(_ladder_uuid(index), (6 + index, 0)) for index in range(7)
+            ) + (
+                vanguard((3, 3), VANGUARD_ID),
+                vanguard((4, 3), VANGUARD_TWO_ID),
+                vanguard((5, 3), VANGUARD_THREE_ID),
+                vanguard((6, 3), VANGUARD_FOURTH_ID),
+                ranger((-3, 3), RANGER_ID),
+                ranger((-3, 4), RANGER_TWO_ID),
+                ranger((-3, 5), RANGER_THREE_ID),
+                ranger((-3, 6), _ladder_uuid(70)),
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)), units=units, resources=60
+            )
+            memory = TacticMemory()
+            SmartTactic(memory, control_path=control_path).choose_actions(turn)
+
+        self.assertTrue(memory.recall)
+        self.assertIsInstance(turn.plan.core_action, SpawnAction)
+        # 7工4先4游：守家 3+3 已满足，阶梯目标 12:4:4 下工人比压 7/12 最低
+        self.assertEqual(
+            turn.plan.core_action.unit_type,
+            UnitType.WORKER,
+            "召回期间应沿用阶梯配比补工人，而不是按 5:4:6 产第 5 个游侠",
+        )
+
+    def test_recall_still_honours_resource_hoard(self) -> None:
+        """回归：召回期间囤积仍要生效。
+
+        hoard_block 原先只写在 develop 分支里，recall 分支在它之前就 return，
+        导致召回时 95/150 完全不检查。
+        """
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {"mode": "develop", "recall": True, "hoard_stage1": True}
+                ),
+                encoding="utf-8",
+            )
+            units = tuple(
+                worker(_ladder_uuid(index), (6 + index, 0)) for index in range(12)
+            ) + tuple(
+                vanguard((3, 3 + index), _ladder_uuid(100 + index))
+                for index in range(4)
+            ) + tuple(
+                ranger((-3, 3 + index), _ladder_uuid(200 + index))
+                for index in range(4)
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=units,
+                # 人口 20 已达门槛，资源低于 95 水位
+                resources=HOARD_STAGE1_RESOURCE_TARGET - 1,
+            )
+            memory = TacticMemory()
+            SmartTactic(memory, control_path=control_path).choose_actions(turn)
+
+        self.assertTrue(memory.recall)
+        self.assertNotIsInstance(
+            turn.plan.core_action,
+            SpawnAction,
+            "召回期间资源低于囤积水位时不应产兵",
+        )
 
     def test_recall_production_prefers_defense(self) -> None:
         with TemporaryDirectory() as directory:
@@ -8504,7 +8665,8 @@ class CompositionLadderTests(unittest.TestCase):
             counts = _split_population(population, weights)
             self.assertEqual(sum(counts), population, msg=f"{population}/{weights}")
 
-    def test_ladder_advances_with_population(self) -> None:
+    def test_ladder_advances_on_composition_met(self) -> None:
+        """阶梯按编制达成推进，不按总人口。"""
         memory = TacticMemory()
         self.assertEqual(memory.target_population, 20)
         self.assertEqual(
@@ -8515,53 +8677,115 @@ class CompositionLadderTests(unittest.TestCase):
             ),
             (12, 4, 4),
         )
-        for population in (0, 10, 19):
-            self.assertEqual(_effective_composition(memory, population), (12, 4, 4))
-            self.assertEqual(_effective_target_population(memory, population), 20)
-        for population in (20, 25, 29):
+        stage2 = (
+            COMPOSITION_STAGE2_WORKERS,
+            COMPOSITION_STAGE2_VANGUARDS,
+            COMPOSITION_STAGE2_RANGERS,
+        )
+        # 第一级未达成：任一兵种缺口都让阶梯停在第一级
+        for counts in ((0, 0, 0), (4, 1, 1), (11, 4, 4), (12, 3, 4), (12, 4, 3)):
+            self.assertEqual(_effective_composition(memory, *counts), (12, 4, 4))
+            self.assertEqual(_effective_target_population(memory, *counts), 20)
+        # 第一级达成 → 升第二级
+        for counts in ((12, 4, 4), (15, 5, 5), (17, 6, 6)):
+            self.assertEqual(_effective_composition(memory, *counts), stage2)
             self.assertEqual(
-                _effective_composition(memory, population),
-                (
-                    COMPOSITION_STAGE2_WORKERS,
-                    COMPOSITION_STAGE2_VANGUARDS,
-                    COMPOSITION_STAGE2_RANGERS,
-                ),
-            )
-            self.assertEqual(
-                _effective_target_population(memory, population),
+                _effective_target_population(memory, *counts),
                 COMPOSITION_STAGE2_POPULATION,
             )
         # 两级都达成后取消人口目标，回落项目默认比例
-        for population in (30, 45):
-            self.assertIsNone(_effective_composition(memory, population))
-            self.assertEqual(_effective_target_population(memory, population), 0)
+        for counts in ((18, 6, 6), (25, 9, 11)):
+            self.assertIsNone(_effective_composition(memory, *counts))
+            self.assertEqual(_effective_target_population(memory, *counts), 0)
             self.assertEqual(
-                _effective_growth_profile(memory, population),
+                _effective_growth_profile(memory, *counts),
                 CONTINUOUS_GROWTH_PROFILE,
             )
+
+    def test_overflow_shifts_thresholds_so_gap_gets_filled(self) -> None:
+        """回归：多产的单位当不存在，被挤掉的编制缺口仍要补齐。
+
+        12:4:4 配置下多产 1 个游侠，人口 20 时是 11工4先5游。若按总人口判定，
+        阶梯会直接进第二级、囤积同时启动，第 12 个工人再也补不上。
+        """
+        memory = TacticMemory()
+        memory.hoard_stage1 = True
+
+        # 11工4先5游 = 20 人：游侠超产 1，工人还差 1
+        counts = (11, 4, 5)
+        self.assertEqual(_composition_overflow(memory, *counts), 1)
+        self.assertEqual(
+            _effective_composition(memory, *counts),
+            (12, 4, 4),
+            "第一级未达成，不得提前升级",
+        )
+        self.assertEqual(
+            _effective_target_population(memory, *counts),
+            21,
+            "目标人口 = 编制之和 20 + 超产 1",
+        )
+        self.assertEqual(
+            _hoard_resource_target(memory, sum(counts), 1),
+            0,
+            "门槛顺移到 21，人口 20 时不得开始囤积",
+        )
+
+        # 补上第 12 个工人 → 12工4先5游 = 21 人：第一级达成，升第二级并开始囤积
+        counts = (12, 4, 5)
+        self.assertEqual(_composition_overflow(memory, *counts), 0)
+        self.assertEqual(
+            _effective_composition(memory, *counts),
+            (
+                COMPOSITION_STAGE2_WORKERS,
+                COMPOSITION_STAGE2_VANGUARDS,
+                COMPOSITION_STAGE2_RANGERS,
+            ),
+        )
+        self.assertEqual(
+            _hoard_resource_target(memory, sum(counts), 0),
+            HOARD_STAGE1_RESOURCE_TARGET,
+        )
+
+    def test_stage_two_composition_is_not_counted_as_overflow(self) -> None:
+        """回归：第二级正常编制不得被误判成超产。
+
+        基准若取第一级（12:4:4），18:6:6 会被算成超产 10，把第二档囤积门槛顺移
+        到 40，永远不触发。
+        """
+        memory = TacticMemory()
+        memory.hoard_stage1 = True
+        memory.hoard_stage2 = True
+        counts = (18, 6, 6)
+        self.assertEqual(_composition_overflow(memory, *counts), 0)
+        self.assertEqual(
+            _hoard_resource_target(memory, sum(counts), 0),
+            HOARD_STAGE2_RESOURCE_TARGET,
+        )
 
     def test_ladder_disabled_by_zero_and_outside_develop(self) -> None:
         memory = TacticMemory()
         memory.target_population = 0
-        self.assertIsNone(_effective_composition(memory, 5))
-        self.assertEqual(_effective_growth_profile(memory, 5), CONTINUOUS_GROWTH_PROFILE)
+        self.assertIsNone(_effective_composition(memory, 5, 1, 1))
+        self.assertEqual(
+            _effective_growth_profile(memory, 5, 1, 1), CONTINUOUS_GROWTH_PROFILE
+        )
 
         memory = TacticMemory()
         memory.composition_workers = 0
         memory.composition_vanguards = 0
         memory.composition_rangers = 0
-        self.assertIsNone(_effective_composition(memory, 5))
+        self.assertIsNone(_effective_composition(memory, 5, 1, 1))
 
         for mode in (MODE_AGGRESS, MODE_BEACON, MODE_MIGRATE):
             memory = TacticMemory()
             memory.mode = mode
-            self.assertIsNone(_effective_composition(memory, 5))
-            self.assertEqual(_effective_target_population(memory, 5), 0)
+            self.assertIsNone(_effective_composition(memory, 5, 1, 1))
+            self.assertEqual(_effective_target_population(memory, 5, 1, 1), 0)
 
     def test_zero_weight_removes_unit_type_from_growth(self) -> None:
         memory = TacticMemory()
         memory.composition_rangers = 0
-        profile = _effective_growth_profile(memory, 5)
+        profile = _effective_growth_profile(memory, 5, 1, 1)
         self.assertNotIn(UnitType.RANGER, {unit_type for unit_type, _ in profile})
         self.assertIn(UnitType.WORKER, {unit_type for unit_type, _ in profile})
 
@@ -8629,8 +8853,8 @@ class CompositionLadderTests(unittest.TestCase):
         )
         turn, _ = make_turn(own_core=core((0, 0)), units=units, resources=40)
         memory = TacticMemory()
-        # 人口 30 → 阶梯用尽；只有囤积开关能继续押后
-        self.assertEqual(_effective_target_population(memory, len(units)), 0)
+        # 18工6先6游 → 两级都达成，阶梯用尽；只有囤积开关能继续押后
+        self.assertEqual(_effective_target_population(memory, 18, 6, 6), 0)
         memory.hoard_stage2 = True
         SmartTactic(memory).choose_actions(turn)
         self.assertEqual(memory.mode, MODE_DEVELOP)

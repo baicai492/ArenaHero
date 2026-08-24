@@ -473,6 +473,11 @@ BROWSER_RESOURCE_HINT_MAX_DISTANCE = DEFAULT_BROWSER_HINT_DISTANCE
 # 2026-08-24 改为控制文件 browser_scout_limit 的默认值。
 DEFAULT_BROWSER_SCOUT_LIMIT = 1
 BROWSER_RESOURCE_SCOUT_LIMIT = DEFAULT_BROWSER_SCOUT_LIMIT
+# 纯探索性质的工人目标：没有确认的资源，只是去看看。资源信号（可见资源、浏览器
+# 提示）可以抢占它们，否则工人会守着过期的探索目标从资源旁边走过。
+EXPLORATION_GOAL_KINDS = frozenset(
+    {"frontier", "develop_frontier", "resource_sweep", "refilled_chunk"}
+)
 CORE_LOGISTICS_CORRIDOR_LENGTH = 3
 MIGRATION_SITE_RADIUS = 3
 MIGRATION_SITE_TOTAL_ATTACK_CELLS = 24
@@ -632,19 +637,84 @@ class DecisionSummary:
     decisions: tuple[str, ...]
 
 
-def _hoard_resource_target(memory: "TacticMemory", population: int) -> int:
+def _composition_met(
+    counts: tuple[int, int, int], target: tuple[int, int, int]
+) -> bool:
+    """三个兵种是否都已达到目标数量。"""
+
+    return all(actual >= want for actual, want in zip(counts, target))
+
+
+def _ladder_composition(
+    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+) -> tuple[int, int, int] | None:
+    """返回当前所处阶梯级别的 (工人, 先锋, 游侠) 目标；None 表示阶梯已用尽。
+
+    2026-08-24 按"编制是否达成"推进，而不是按总人口。若按人口推进，超产的兵种
+    会把阶梯提前推到下一级，被挤掉的缺口永远补不上：12:4:4 配置下多产 1 个游侠
+    时人口 20 是 11工4先5游，按人口判定会直接进第二级并同时启动囤积，第 12 个
+    工人再也补不上。按编制判定则第一级仍未达成，工人补到 12（总人口 21）后才升级。
+    """
+
+    if not _composition_ladder_enabled(memory):
+        return None
+    counts = (workers, vanguards, rangers)
+    stage1 = _split_population(
+        memory.target_population,
+        (
+            memory.composition_workers,
+            memory.composition_vanguards,
+            memory.composition_rangers,
+        ),
+    )
+    if not _composition_met(counts, stage1):
+        return stage1
+    stage2 = (
+        COMPOSITION_STAGE2_WORKERS,
+        COMPOSITION_STAGE2_VANGUARDS,
+        COMPOSITION_STAGE2_RANGERS,
+    )
+    if not _composition_met(counts, stage2):
+        return stage2
+    return None
+
+
+def _composition_overflow(
+    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+) -> int:
+    """相对当前阶梯级别目标的超产数量。
+
+    2026-08-24 用户战术：多产出来的单位就当不存在，继续把其它兵种补齐，允许总
+    人口比目标多出超产的那几个，再开始囤积。基准必须是"当前级"而不是"第一级"，
+    否则第二级的正常编制（18:6:6）相对第一级（12:4:4）会被误判成超产 10，把囤积
+    门槛顺移到 40，第二档永远不触发。
+    """
+
+    target = _ladder_composition(memory, workers, vanguards, rangers)
+    if target is None:
+        return 0
+    return sum(
+        max(0, actual - want)
+        for actual, want in zip((workers, vanguards, rangers), target)
+    )
+
+
+def _hoard_resource_target(
+    memory: "TacticMemory", population: int, overflow: int = 0
+) -> int:
     """返回当前人口下的资源囤积目标；0 表示不囤积。
 
     仅 develop 发育模式生效。两档开关互相独立，同时命中时取较高目标，因此只开
-    第一档也能在人口 30 之后继续维持 95 的水位。
+    第一档也能在人口 30 之后继续维持 95 的水位。overflow 是超产数量，会把人口
+    门槛整体顺移，让被多产挤掉的编制缺口先补齐（见 _composition_overflow）。
     """
 
     if memory.mode != MODE_DEVELOP:
         return 0
     target = 0
-    if memory.hoard_stage1 and population >= HOARD_STAGE1_POPULATION:
+    if memory.hoard_stage1 and population >= HOARD_STAGE1_POPULATION + overflow:
         target = HOARD_STAGE1_RESOURCE_TARGET
-    if memory.hoard_stage2 and population >= HOARD_STAGE2_POPULATION:
+    if memory.hoard_stage2 and population >= HOARD_STAGE2_POPULATION + overflow:
         target = max(target, HOARD_STAGE2_RESOURCE_TARGET)
     return target
 
@@ -664,46 +734,31 @@ def _composition_ladder_enabled(memory: "TacticMemory") -> bool:
     )
 
 
-def _effective_target_population(memory: "TacticMemory", population: int) -> int:
-    """返回当前生效的目标人口；0 表示已进入不限人口的连续增长。"""
+def _effective_target_population(
+    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
+) -> int:
+    """返回当前生效的目标人口；0 表示已进入不限人口的连续增长。
 
-    if not _composition_ladder_enabled(memory):
+    等于当前级编制之和加上超产量——超产的单位不会被裁掉，所以实际会长到这个数。
+    """
+
+    target = _ladder_composition(memory, workers, vanguards, rangers)
+    if target is None:
         return 0
-    if population < memory.target_population:
-        return memory.target_population
-    if population < COMPOSITION_STAGE2_POPULATION:
-        return COMPOSITION_STAGE2_POPULATION
-    return 0
+    return sum(target) + _composition_overflow(memory, workers, vanguards, rangers)
 
 
 def _effective_composition(
-    memory: "TacticMemory", population: int
+    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
 ) -> tuple[int, int, int] | None:
-    """返回当前人口所处阶梯的 (工人, 先锋, 游侠) 目标编制。
+    """返回当前阶梯级别的 (工人, 先锋, 游侠) 目标编制。
 
-    阶梯第一级由控制文件配置（默认 20 人 12:4:4），达成后自动升到第二级 30 人
-    18:6:6；两级都达成后返回 None，由调用方回落各模式的项目默认编制。目标人口
-    或配比合计设为 0，以及非 develop 模式，同样返回 None。
+    阶梯第一级由控制文件配置（默认 20 人 12:4:4），三个兵种都达标后升到第二级
+    30 人 18:6:6；两级都达标后返回 None，由调用方回落各模式的项目默认编制。目标
+    人口或配比合计设为 0，以及非 develop 模式，同样返回 None。
     """
 
-    if not _composition_ladder_enabled(memory):
-        return None
-    if population < memory.target_population:
-        return _split_population(
-            memory.target_population,
-            (
-                memory.composition_workers,
-                memory.composition_vanguards,
-                memory.composition_rangers,
-            ),
-        )
-    if population < COMPOSITION_STAGE2_POPULATION:
-        return (
-            COMPOSITION_STAGE2_WORKERS,
-            COMPOSITION_STAGE2_VANGUARDS,
-            COMPOSITION_STAGE2_RANGERS,
-        )
-    return None
+    return _ladder_composition(memory, workers, vanguards, rangers)
 
 
 def _split_population(
@@ -729,7 +784,7 @@ def _split_population(
 
 
 def _effective_growth_profile(
-    memory: "TacticMemory", population: int
+    memory: "TacticMemory", workers: int, vanguards: int, rangers: int
 ) -> tuple[tuple[UnitType, int], ...]:
     """返回连续增长的 (兵种, 权重) 序列；阶梯用尽后沿用默认 5:4:6。
 
@@ -737,7 +792,7 @@ def _effective_growth_profile(
     偏向战斗兵；权重 0 的兵种被排除，因此 12:4:0 表示不再产游侠。
     """
 
-    composition = _effective_composition(memory, population)
+    composition = _effective_composition(memory, workers, vanguards, rangers)
     if composition is None:
         return CONTINUOUS_GROWTH_PROFILE
     workers, vanguards, rangers = composition
@@ -2285,7 +2340,13 @@ class TacticMemory:
                 else 0
             )
             # 阶梯用尽时回落项目默认编制，让面板 tooltip 显示实际生效的目标。
-            effective_composition = _effective_composition(self, len(turn.units)) or (
+            stats_counts = (
+                len(turn.workers),
+                len(turn.vanguards),
+                len(turn.rangers),
+            )
+            stats_overflow = _composition_overflow(self, *stats_counts)
+            effective_composition = _effective_composition(self, *stats_counts) or (
                 DEVELOP_TARGET_WORKERS,
                 RAID_HOME_RESERVE_VANGUARDS + DEVELOP_BEACON_EXPEDITION_VANGUARDS,
                 RAID_HOME_RESERVE_RANGERS + DEVELOP_BEACON_EXPEDITION_RANGERS,
@@ -2330,7 +2391,9 @@ class TacticMemory:
                 "beacon_target_distance": self.beacon_target_distance,
                 "hoard_stage1": self.hoard_stage1,
                 "hoard_stage2": self.hoard_stage2,
-                "hoard_target": _hoard_resource_target(self, len(turn.units)),
+                "hoard_target": _hoard_resource_target(
+                    self, len(turn.units), stats_overflow
+                ),
                 "target_population": self.target_population,
                 "composition_workers": self.composition_workers,
                 "composition_vanguards": self.composition_vanguards,
@@ -2351,8 +2414,10 @@ class TacticMemory:
                     else 0
                 ),
                 "effective_target_population": _effective_target_population(
-                    self, len(turn.units)
+                    self, *stats_counts
                 ),
+                # 超产量：多产的单位当不存在，人口门槛整体顺移这么多格。
+                "composition_overflow": stats_overflow,
                 # 拆成三个标量而不是一个列表：overlay server 的 _normalize_stats
                 # 只认 bool/int/str，列表类型会被无条件替换成默认值。
                 "effective_workers": effective_composition[0],
@@ -4770,12 +4835,7 @@ class SmartTactic:
         if available_resources:
             for worker in unassigned.values():
                 goal = self.memory.worker_goals.get(str(worker.id))
-                if goal is not None and goal.kind in {
-                    "frontier",
-                    "develop_frontier",
-                    "resource_sweep",
-                    "refilled_chunk",
-                }:
+                if goal is not None and goal.kind in EXPLORATION_GOAL_KINDS:
                     self.memory.clear_worker_goal(worker)
 
         # A resource that leaves current vision remains a confirmed stale hint.
@@ -4956,21 +5016,27 @@ class SmartTactic:
                 and _distance(turn.core.position, position) <= browser_hint_distance
                 and not _currently_visible(turn, position, self.memory.known_obstacles)
             }
-            # 提示是低可信线索，默认只派 1 名探子，其余工人保持本地搜索和采集
-            # 编队；browser_scout_limit 可在面板调高。
-            browser_workers = sorted(
-                unassigned.values(),
-                key=lambda worker: (
-                    min(
-                        (_distance(worker.position, target) for target in browser_targets),
-                        default=0,
-                    ),
-                    worker.id.bytes,
+            # 2026-08-24 按"提示↔工人"配对距离挑人，而不是按工人到最近提示的
+            # 全局最小值排序。旧写法只保证被选中的工人离"某个"提示近，实测出现
+            # 离水晶 70/86 格的工人被派去，而 10 格外的工人继续探图。
+            pairings = sorted(
+                (
+                    (_distance(worker.position, target), worker.id.bytes, worker.id)
+                    for target in browser_targets
+                    for worker in unassigned.values()
                 ),
-            )[: self.memory.browser_scout_limit]
+                key=lambda item: (item[0], item[1]),
+            )
+            browser_worker_ids: list[UUID] = []
+            for _, _, worker_id in pairings:
+                if len(browser_worker_ids) >= self.memory.browser_scout_limit:
+                    break
+                if worker_id not in browser_worker_ids:
+                    browser_worker_ids.append(worker_id)
             browser_unassigned = {
-                worker.id: worker
-                for worker in browser_workers
+                worker_id: unassigned[worker_id]
+                for worker_id in browser_worker_ids
+                if worker_id in unassigned
             }
             candidate_ids = set(browser_unassigned)
             self._assign_worker_targets(
@@ -6430,9 +6496,21 @@ class SmartTactic:
         # 第二级（30 人 / 攒 150）永远无法执行。囤积开关同样要押后：它在人口 30
         # 之后才触发，而那时阶梯已经用尽，只看阶梯会让第二档囤积同样落空。
         # 想恢复自动抢信标：关掉两个囤积开关，并把 target_population 设为 0。
+        # overflow 与 _select_spawn 保持一致，否则超产时两边对"阶梯是否还没跑完"
+        # 的判断会错位：产兵侧还在补第一级，这里却已经放行切模式。
+        expedition_counts = (
+            len(turn.workers),
+            len(turn.vanguards),
+            len(turn.rangers),
+        )
         if (
-            _effective_target_population(self.memory, len(turn.units)) > 0
-            or _hoard_resource_target(self.memory, len(turn.units)) > 0
+            _effective_target_population(self.memory, *expedition_counts) > 0
+            or _hoard_resource_target(
+                self.memory,
+                len(turn.units),
+                _composition_overflow(self.memory, *expedition_counts),
+            )
+            > 0
         ):
             return
         required_vanguards = (
@@ -10874,13 +10952,19 @@ class SmartTactic:
         shield_cap = 10 if owns_beacon else 5
         reserve = 2 if near_threat or core.shield < shield_cap else 0
         budget = projected_resources - reserve
-        # 2026-08-24 资源囤积（仅 develop）：水位是产兵的解锁阈值，不是产兵后的下限。
+        # 超产量：多产出来的单位当不存在，把阶梯与囤积的人口门槛整体顺移，让被
+        # 挤掉的编制缺口先补齐（详见 _composition_overflow）。
+        composition_overflow = _composition_overflow(
+            self.memory, workers, vanguards, rangers
+        )        # 2026-08-24 资源囤积（仅 develop）：水位是产兵的解锁阈值，不是产兵后的下限。
         # 仓库容量 = max(10, 人口 × 5)，人口 20 只有 100、人口 30 只有 150，若要求
         # 产兵后仍不跌破 95 / 150，则连一个工人都买不起，人口会永久卡死。因此改为
         # 攒到水位才放行一次产兵，花掉后重新攒回水位，常态维持接近满仓的库存。
         # 四类逆风情况破例放行——攒资源是顺风局的优化，逆风时高库存只会变成敌方
         # 斩首的战利品（摧毁 Core 会转移其库存资源）。
-        hoard_target = _hoard_resource_target(self.memory, current_population)
+        hoard_target = _hoard_resource_target(
+            self.memory, current_population, composition_overflow
+        )
         hoard_block = (
             hoard_target > 0
             and projected_resources < hoard_target
@@ -10895,6 +10979,15 @@ class SmartTactic:
         )
         mode = self.memory.mode
         recall = self.memory.recall
+        # 2026-08-24 阶梯配比在 recall 之前算好。手动召回只是收兵回防，编制意图
+        # 不变，因此召回分支补齐守军后的连续增长也要沿用阶梯配比；此前它调用
+        # continuous_growth_spawn() 不传 profile，退回默认 5:4:6，实测 12:4:4 配置
+        # 下人口 15（7工4先4游）时按 5:4:6 算游侠比压最低，于是产出第 5 个游侠，
+        # 违背了面板设定。灾后重建（recovery_active）仍保持默认比例：那是真灾难，
+        # 生存优先于编制意图。
+        develop_growth_profile = _effective_growth_profile(
+            self.memory, workers, vanguards, rangers
+        )
         known_core_target = (
             self._pick_enemy_core_target(turn)
             if mode == MODE_AGGRESS
@@ -11001,12 +11094,13 @@ class SmartTactic:
                 return UnitType.RANGER
             if workers < AGGRESS_BASE_WORKERS and budget >= worker_cost:
                 return UnitType.WORKER
-            return continuous_growth_spawn()
+            # 守军底线补齐后，召回期间的扩张仍按面板设定的编制来：手动召回只是
+            # 收兵回防，不该让阶梯与囤积失效。
+            if hoard_block:
+                return None
+            return continuous_growth_spawn(develop_growth_profile)
 
         if mode == MODE_DEVELOP:
-            develop_growth_profile = _effective_growth_profile(
-                self.memory, current_population
-            )
             if workers < 4 and budget >= worker_cost:
                 return UnitType.WORKER
             if vanguards < 1 and budget >= vanguard_cost:
@@ -11038,7 +11132,9 @@ class SmartTactic:
             # 阶梯用尽后 composition 为 None，回落项目默认的 3+1 先锋 / 3+2 游侠 /
             # 12 工人（即 12:4:5 = 21 人）。每级内部顺序与原策略一致：先锋 → 游侠
             # → 工人。第一级只比原编制少 1 名游侠，让总数正好卡在涨价档前。
-            composition = _effective_composition(self.memory, current_population)
+            composition = _effective_composition(
+                self.memory, workers, vanguards, rangers
+            )
             vanguard_target = (
                 composition[1]
                 if composition is not None
