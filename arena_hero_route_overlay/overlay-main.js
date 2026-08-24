@@ -21,6 +21,9 @@
     composition_workers: 12,
     composition_vanguards: 4,
     composition_rangers: 4,
+    growth_workers: 5,
+    growth_vanguards: 4,
+    growth_rangers: 6,
     browser_hint_distance: 32,
     browser_scout_limit: 1,
     resource_leash_distance: 38,
@@ -439,6 +442,24 @@
       default:
         return null;
     }
+  }
+
+  // 当前实际用于连续增长的权重：阶梯生效时是本级编制，用尽后是 growth_*。
+  function growthStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.effective_growth_workers !== "number") {
+      return "";
+    }
+    const weights = `${stats.effective_growth_workers}:${stats.effective_growth_vanguards}:${stats.effective_growth_rangers}`;
+    const source =
+      (stats.effective_target_population ?? 0) > 0
+        ? "阶梯生效中，权重来自本级目标编制；本组要等阶梯跑完才起作用"
+        : "阶梯已用尽，权重来自本组设定";
+    const counts =
+      typeof stats.workers === "number"
+        ? `\n当前编制 ${stats.workers}工 ${stats.vanguards}先 ${stats.rangers}游`
+        : "";
+    return `\n当前生效：权重 ${weights}（${source}）${counts}`;
   }
 
   // 水晶提示的实时状态：抓取是否在线、当前采纳了几个提示。
@@ -934,6 +955,25 @@
           "\n默认 12:4:4 与 develop 原编制 12工4先5游 只差 1 名游侠，让总数正好落在人口 20 的涨价档前。" +
           "\n" +
           ladderStatusText(),
+        { maximum: 200, step: 1 },
+      );
+    }
+    for (const [key, labelText] of [
+      ["growth_workers", "增长配比 · 工人"],
+      ["growth_vanguards", "增长配比 · 先锋"],
+      ["growth_rangers", "增长配比 · 游侠"],
+    ]) {
+      addControlNumber(
+        panel,
+        key,
+        labelText,
+        () =>
+          "【develop 发育模式】阶梯用尽后的连续增长配比，默认 5:4:6 即项目原策略。" +
+          "\n上面的「配比」管的是阶梯每一级的目标编制（绝对数量）；这一组管的是阶梯跑完之后的长期增长权重（相对比例）。" +
+          "\n生效时机：第二级（默认 30 人 18:6:6）完成后，或把「目标人口」设为 0 关掉阶梯时。" +
+          "\n三项全为 0 同样回落 5:4:6。单项设为 0 表示不再生产该兵种。" +
+          "\n用途：18工6先6游 回落 5:4:6 后工人比压 18/5=3.6 远超容差 0.2，要等游侠涨到 18、先锋涨到 14 才会重新产工人（约人口 50+），期间采集能力冻结、单位成本却一路上涨。把工人权重调高（例如 12:5:7）即可避免。" +
+          growthStatusText(),
         { maximum: 200, step: 1 },
       );
     }

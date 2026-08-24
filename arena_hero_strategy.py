@@ -292,6 +292,11 @@ COMPOSITION_STAGE2_POPULATION = 30
 COMPOSITION_STAGE2_WORKERS = 18
 COMPOSITION_STAGE2_VANGUARDS = 6
 COMPOSITION_STAGE2_RANGERS = 6
+# 阶梯用尽（或目标人口设为 0）后的连续增长配比，默认等于 CONTINUOUS_GROWTH_PROFILE
+# 的 5:4:6，即项目原策略。三项全为 0 同样回落 5:4:6。
+DEFAULT_GROWTH_WORKERS = 5
+DEFAULT_GROWTH_VANGUARDS = 4
+DEFAULT_GROWTH_RANGERS = 6
 # Once the Beacon home screen has five Vanguards, preserve the next affordable
 # resource window for the cheaper pre-population-20 Ranger instead of filling
 # a sixth/eighth Vanguard first.
@@ -818,25 +823,15 @@ def _split_population(
     return (counts[0], counts[1], counts[2])
 
 
-def _effective_growth_profile(
-    memory: "TacticMemory",
-    workers: int,
-    vanguards: int,
-    rangers: int,
-    resources: int | None = None,
+def _weight_profile(
+    workers: int, vanguards: int, rangers: int
 ) -> tuple[tuple[UnitType, int], ...]:
-    """返回连续增长的 (兵种, 权重) 序列；阶梯用尽后沿用默认 5:4:6。
+    """把三个权重排成 (兵种, 权重) 序列；全为 0 时回落项目默认 5:4:6。
 
-    权重顺序与 CONTINUOUS_GROWTH_PROFILE 保持一致，让同压力时的稳定排序继续
-    偏向战斗兵；权重 0 的兵种被排除，因此 12:4:0 表示不再产游侠。
+    顺序与 CONTINUOUS_GROWTH_PROFILE 保持一致（游侠 → 先锋 → 工人），让同压力时
+    的稳定排序继续偏向战斗兵；权重 0 的兵种被排除，因此 12:4:0 表示不再产游侠。
     """
 
-    composition = _effective_composition(
-        memory, workers, vanguards, rangers, resources
-    )
-    if composition is None:
-        return CONTINUOUS_GROWTH_PROFILE
-    workers, vanguards, rangers = composition
     configured = tuple(
         (unit_type, weight)
         for unit_type, weight in (
@@ -847,6 +842,34 @@ def _effective_growth_profile(
         if weight > 0
     )
     return configured or CONTINUOUS_GROWTH_PROFILE
+
+
+def _effective_growth_profile(
+    memory: "TacticMemory",
+    workers: int,
+    vanguards: int,
+    rangers: int,
+    resources: int | None = None,
+) -> tuple[tuple[UnitType, int], ...]:
+    """返回连续增长的 (兵种, 权重) 序列。
+
+    阶梯生效时用该级的目标编制当权重；阶梯用尽（或目标人口设为 0）后改用控制
+    文件的 growth_* 配比，默认 5:4:6 即项目原策略。
+    2026-08-24 加这个可配项是为了解决工人冻结：18工6先6游 回落 5:4:6 后工人比压
+    18/5 = 3.6 远超容差，要等游侠涨到 18、先锋涨到 14 才会重新产工人（约人口
+    50+），期间采集能力冻结、单位成本却一路上涨。
+    """
+
+    composition = _effective_composition(
+        memory, workers, vanguards, rangers, resources
+    )
+    if composition is None:
+        return _weight_profile(
+            memory.growth_workers,
+            memory.growth_vanguards,
+            memory.growth_rangers,
+        )
+    return _weight_profile(*composition)
 
 
 @dataclass
@@ -896,6 +919,10 @@ class TacticMemory:
     composition_workers: int = DEFAULT_COMPOSITION_WORKERS
     composition_vanguards: int = DEFAULT_COMPOSITION_VANGUARDS
     composition_rangers: int = DEFAULT_COMPOSITION_RANGERS
+    # 2026-08-24 阶梯用尽后的连续增长配比（control 配置），默认 5:4:6 即原策略。
+    growth_workers: int = DEFAULT_GROWTH_WORKERS
+    growth_vanguards: int = DEFAULT_GROWTH_VANGUARDS
+    growth_rangers: int = DEFAULT_GROWTH_RANGERS
     # 2026-08-24 浏览器水晶提示的搜索半径（control 配置），0 表示不使用提示。
     browser_hint_distance: int = DEFAULT_BROWSER_HINT_DISTANCE
     # 2026-08-24 每 Tick 最多派几名工人验证浏览器提示（control 配置）。
@@ -2162,6 +2189,9 @@ class TacticMemory:
                 "composition_workers",
                 "composition_vanguards",
                 "composition_rangers",
+                "growth_workers",
+                "growth_vanguards",
+                "growth_rangers",
                 "browser_hint_distance",
                 "browser_scout_limit",
                 "resource_leash_distance",
@@ -2390,6 +2420,7 @@ class TacticMemory:
                 turn.resources,
             )
             stats_overflow = _composition_overflow(self, *stats_counts)
+            stats_growth = dict(_effective_growth_profile(self, *stats_counts))
             effective_composition = _effective_composition(self, *stats_counts) or (
                 DEVELOP_TARGET_WORKERS,
                 RAID_HOME_RESERVE_VANGUARDS + DEVELOP_BEACON_EXPEDITION_VANGUARDS,
@@ -2450,6 +2481,16 @@ class TacticMemory:
                 "composition_workers": self.composition_workers,
                 "composition_vanguards": self.composition_vanguards,
                 "composition_rangers": self.composition_rangers,
+                "growth_workers": self.growth_workers,
+                "growth_vanguards": self.growth_vanguards,
+                "growth_rangers": self.growth_rangers,
+                # 当前实际用于连续增长的权重（阶梯生效时是本级编制，用尽后是
+                # growth_*），面板 tooltip 直接显示。
+                "effective_growth_workers": stats_growth.get(UnitType.WORKER, 0),
+                "effective_growth_vanguards": stats_growth.get(
+                    UnitType.VANGUARD, 0
+                ),
+                "effective_growth_rangers": stats_growth.get(UnitType.RANGER, 0),
                 "browser_hint_distance": self.browser_hint_distance,
                 "browser_scout_limit": self.browser_scout_limit,
                 "resource_leash_distance": self.resource_leash_distance,

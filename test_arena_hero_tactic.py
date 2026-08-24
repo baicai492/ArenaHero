@@ -8925,6 +8925,102 @@ class CompositionLadderTests(unittest.TestCase):
                 f"人口 {population} 应维持 150 水位",
             )
 
+    def test_growth_ratio_is_configurable_after_ladder(self) -> None:
+        """阶梯用尽后改用 growth_* 配比，默认 5:4:6 即项目原策略。
+
+        用途：18工6先6游 回落 5:4:6 后工人比压 18/5=3.6 远超容差 0.2，要等游侠
+        涨到 18、先锋涨到 14 才会重新产工人（约人口 50+），期间采集能力冻结。
+        """
+
+        exhausted = (18, 6, 6)  # 第二级达成
+        resources = HOARD_STAGE2_RESOURCE_TARGET
+
+        def memory_with(weights: tuple[int, int, int]) -> TacticMemory:
+            memory = TacticMemory()
+            memory.hoard_stage1 = True
+            memory.hoard_stage2 = True
+            memory.growth_workers = weights[0]
+            memory.growth_vanguards = weights[1]
+            memory.growth_rangers = weights[2]
+            return memory
+
+        # 默认值等于项目原策略，不改配置则行为不变
+        default_memory = memory_with((5, 4, 6))
+        self.assertEqual(default_memory.growth_workers, 5)
+        self.assertEqual(default_memory.growth_vanguards, 4)
+        self.assertEqual(default_memory.growth_rangers, 6)
+        self.assertIsNone(
+            _effective_composition(default_memory, *exhausted, resources),
+            "第二级达成且攒够 150 → 阶梯用尽",
+        )
+        self.assertEqual(
+            _effective_growth_profile(default_memory, *exhausted, resources),
+            CONTINUOUS_GROWTH_PROFILE,
+        )
+
+        # 自定义配比生效，且保持"游侠 → 先锋 → 工人"的稳定排序
+        custom = memory_with((12, 5, 7))
+        self.assertEqual(
+            _effective_growth_profile(custom, *exhausted, resources),
+            (
+                (UnitType.RANGER, 7),
+                (UnitType.VANGUARD, 5),
+                (UnitType.WORKER, 12),
+            ),
+        )
+
+        # 三项全为 0 回落原策略
+        self.assertEqual(
+            _effective_growth_profile(memory_with((0, 0, 0)), *exhausted, resources),
+            CONTINUOUS_GROWTH_PROFILE,
+        )
+
+        # 单项为 0 表示不再生产该兵种
+        profile = _effective_growth_profile(
+            memory_with((1, 0, 0)), *exhausted, resources
+        )
+        self.assertEqual({unit for unit, _ in profile}, {UnitType.WORKER})
+
+    def test_growth_ratio_ignored_while_ladder_active(self) -> None:
+        """阶梯生效时权重仍来自本级目标编制，growth_* 只管阶梯之后。"""
+
+        memory = TacticMemory()
+        memory.growth_workers = 1
+        memory.growth_vanguards = 0
+        memory.growth_rangers = 0
+        # 第一级 12:4:4 未达成
+        self.assertEqual(
+            _effective_growth_profile(memory, 6, 2, 2),
+            (
+                (UnitType.RANGER, 4),
+                (UnitType.VANGUARD, 4),
+                (UnitType.WORKER, 12),
+            ),
+            "阶梯生效期间不应使用 growth_* 配比",
+        )
+
+    def test_growth_ratio_read_from_control_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "develop",
+                        "growth_workers": 12,
+                        "growth_vanguards": 5,
+                        "growth_rangers": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            memory.load_control(control_path)
+
+        self.assertEqual(
+            (memory.growth_workers, memory.growth_vanguards, memory.growth_rangers),
+            (12, 5, 7),
+        )
+
     def test_ladder_disabled_by_zero_and_outside_develop(self) -> None:
         memory = TacticMemory()
         memory.target_population = 0
