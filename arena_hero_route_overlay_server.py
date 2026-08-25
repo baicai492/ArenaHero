@@ -36,6 +36,7 @@ CONTROL_FLAG_DEFAULTS = {
     "hoard_stage1": False,
     "hoard_stage2": False,
     "optimal_spawn_order": False,
+    "yield_path_to_workers": False,
 }
 EMPTY_ROUTES = {
     "version": 2,
@@ -73,6 +74,7 @@ EMPTY_STATS = {
     "growth_vanguards": 4,
     "growth_rangers": 6,
     "optimal_spawn_order": False,
+    "yield_path_to_workers": False,
     "effective_growth_workers": 5,
     "effective_growth_vanguards": 4,
     "effective_growth_rangers": 6,
@@ -129,6 +131,9 @@ EMPTY_STATS = {
     "deposit_count": 0,
     "shoot_count": 0,
     "move_failures": 0,
+    "yield_path_to_worker_total": 0,
+    "cargo_stuck_total": 0,
+    "cargo_queue_hold_total": 0,
     "manual_overrides": 0,
     "event_totals": {},
     "decision_totals": {},

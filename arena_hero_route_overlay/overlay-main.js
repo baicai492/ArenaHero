@@ -34,6 +34,7 @@
     hoard_stage1: false,
     hoard_stage2: false,
     optimal_spawn_order: false,
+    yield_path_to_workers: false,
   };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
@@ -407,6 +408,27 @@
       ? "严格下限：需攒到 水位+该单位成本，产完仍不跌破水位"
       : "解锁阈值：容量装不下 水位+最贵单位，攒到水位即放行一次";
     return `\n当前生效：囤积目标 ${stats.hoard_target} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}\n${mode}`;
+  }
+
+  // 让路开关的实时状态：本局累计让路次数与当前卡住的工人数。
+  function yieldPathStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.yield_path_to_workers !== "boolean") {
+      return "";
+    }
+    if (!stats.yield_path_to_workers) {
+      return "\n当前生效：未开启，挡路单位不会为工人挪开";
+    }
+    const yields = stats.yield_path_to_worker_total;
+    const stuck = stats.cargo_stuck_total;
+    const parts = [];
+    if (typeof yields === "number") {
+      parts.push(`累计让路 ${yields} 次`);
+    }
+    if (typeof stuck === "number") {
+      parts.push(`累计载货打转 ${stuck} 次`);
+    }
+    return parts.length ? `\n当前生效：${parts.join(" · ")}` : "\n当前生效：已开启";
   }
 
   // 全局最优生产顺序的实时状态：说明当前按哪个顺序补缺口。
@@ -952,6 +974,22 @@
         "\n已经超产时暂时允许总数到 目标+超产量：只补还没达标的兵种，达标或超出的不再增加。" +
         "\n与囤积叠加时的放行线是 水位 + 该顺序下一个要产单位的成本。" +
         optimalOrderStatusText(),
+    );
+    addControlCheckbox(
+      panel,
+      "yield_path_to_workers",
+      "优先给工人让路",
+      () =>
+        "勾选后，挡住工人去路的自己人会主动挪开一步。" +
+        "\n每格最多容纳 2 个实体，人口一多（尤其召回时战斗单位堆在 Core 附近），" +
+        "载货工人明明地形上有路，却因为沿途格子被自己人占满而寻不到路，" +
+        "只能在两格之间来回走，货一直卸不掉。" +
+        "\n判定很窄：只有「地形通、占用不通」才算被自己人堵住，纯地形死路不会误触发。" +
+        "\n做法：沿工人的地形通路找到第一个占满的格子，让那里没载货、本 Tick 还没动作的" +
+        "单位闪避一步（避开工人整条通路），占用数当场下降，工人同一 Tick 就能继续走。" +
+        "\n战斗单位优先让路；载货工人不会被推开。Core 5 格内有敌时不生效，生存优先。" +
+        "\n注意：这是 Core 门口腾位（只清 Core 格与 4 个邻格）之外的补充，管更外面的走廊。" +
+        yieldPathStatusText(),
     );
     addControlNumber(
       panel,

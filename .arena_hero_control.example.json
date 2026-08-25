@@ -15,6 +15,7 @@
   "hoard_stage1": false,
   "hoard_stage2": false,
   "optimal_spawn_order": false,
+  "yield_path_to_workers": false,
   "target_population": 20,
   "composition_workers": 12,
   "composition_vanguards": 4,

@@ -489,6 +489,16 @@ EXPLORATION_GOAL_KINDS = frozenset(
     {"frontier", "develop_frontier", "resource_sweep", "refilled_chunk"}
 )
 CORE_LOGISTICS_CORRIDOR_LENGTH = 3
+# 2026-08-25 给工人让路（control `yield_path_to_workers`）。每格最多容纳 2 个实体，
+# 人口一多、战斗单位又被召回堆在 Core 附近时，载货工人的地形通路是通的、却被自己
+# 人占满而无法寻路，`planner.toward` 退化成单步贪心，于是在两格之间来回走。
+# 每 Tick 最多救几名工人（限制遍历成本，其余下个 Tick 继续）。
+WORKER_YIELD_MAX_WORKERS_PER_TICK = 4
+# 沿工人的地形通路往前扫这么多格找第一个真正堵死的格子。
+WORKER_YIELD_PATH_SCAN_LENGTH = 8
+# Core 这么近有敌人时不为物流打散阵型，生存优先（与 vacate 同一条边界）。
+WORKER_YIELD_CORE_THREAT_RADIUS = 5
+DEFAULT_YIELD_PATH_TO_WORKERS = False
 MIGRATION_SITE_RADIUS = 3
 MIGRATION_SITE_TOTAL_ATTACK_CELLS = 24
 MIGRATION_SITE_RANGED_ATTACK_CELLS = 16
@@ -930,6 +940,8 @@ class TacticMemory:
     growth_rangers: int = DEFAULT_GROWTH_RANGERS
     # 2026-08-24 全局最优生产顺序（control 配置）：按基础价降序补缺口。
     optimal_spawn_order: bool = DEFAULT_OPTIMAL_SPAWN_ORDER
+    # 2026-08-25 给工人让路（control 配置）：挡路的自己人主动挪开一步。
+    yield_path_to_workers: bool = DEFAULT_YIELD_PATH_TO_WORKERS
     # 2026-08-24 浏览器水晶提示的搜索半径（control 配置），0 表示不使用提示。
     browser_hint_distance: int = DEFAULT_BROWSER_HINT_DISTANCE
     # 2026-08-24 每 Tick 最多派几名工人验证浏览器提示（control 配置）。
@@ -2194,6 +2206,9 @@ class TacticMemory:
             self.optimal_spawn_order = bool(
                 data.get("optimal_spawn_order", self.optimal_spawn_order)
             )
+            self.yield_path_to_workers = bool(
+                data.get("yield_path_to_workers", self.yield_path_to_workers)
+            )
             for key in (
                 "target_population",
                 "composition_workers",
@@ -2495,6 +2510,7 @@ class TacticMemory:
                 "growth_vanguards": self.growth_vanguards,
                 "growth_rangers": self.growth_rangers,
                 "optimal_spawn_order": self.optimal_spawn_order,
+                "yield_path_to_workers": self.yield_path_to_workers,
                 # 当前实际用于连续增长的权重（阶梯生效时是本级编制，用尽后是
                 # growth_*），面板 tooltip 直接显示。
                 "effective_growth_workers": stats_growth.get(UnitType.WORKER, 0),
@@ -2649,6 +2665,17 @@ class TacticMemory:
                 "deposit_count": self.decision_totals.get("worker:deposit", 0),
                 "shoot_count": self.decision_totals.get("ranger:shoot", 0),
                 "move_failures": self.event_totals.get("UNIT_MOVE_FAILED", 0),
+                # 让路诊断：让路次数与载货打转次数一起看才有意义——开启让路后
+                # 打转计数应该停止增长，否则堵点不在我方单位占用上。
+                "yield_path_to_worker_total": self.decision_totals.get(
+                    "logistics:yield_path_to_worker", 0
+                ),
+                "cargo_stuck_total": self.decision_totals.get(
+                    "worker:cargo_stuck", 0
+                ),
+                "cargo_queue_hold_total": self.decision_totals.get(
+                    "worker:cargo_queue_hold", 0
+                ),
                 "manual_overrides": self.decision_totals.get(
                     "manual_override:move", 0
                 ),
@@ -3173,6 +3200,47 @@ class MovementPlanner:
         self.memory.decision_totals[f"move:{reason}"] += 1
         return True
 
+    def path_for(
+        self,
+        unit: Unit,
+        goal: Position,
+        *,
+        avoid: Iterable[Position] = (),
+    ) -> tuple[Direction, ...]:
+        """当前占用情况下的完整寻路结果；空元组表示这一 Tick 走不通。
+
+        `toward()` 走不通时会退化成单步贪心，从外面看不出是"没路"还是"绕路"。
+        让路逻辑需要区分这两者，所以把寻路本身暴露出来。
+        """
+
+        return _find_path(
+            unit.position,
+            goal,
+            blocked=self._blocked(unit, goal, frozenset(avoid)),
+            threat=self.threat,
+            visited=self.memory.visited,
+        )
+
+    def terrain_path_for(self, unit: Unit, goal: Position) -> tuple[Direction, ...]:
+        """只看地形、敌人与临时封锁的寻路结果，忽略我方单位占用。
+
+        与 `path_for()` 一起用：地形通、占用不通 = 被自己人堵住。
+        """
+
+        blocked = set(self.obstacles) | set(self.enemy_cells)
+        blocked.update(
+            position
+            for position, until in self.memory.temporary_blocks.items()
+            if until > self.turn.tick
+        )
+        return _find_path(
+            unit.position,
+            goal,
+            blocked=blocked,
+            threat=self.threat,
+            visited=self.memory.visited,
+        )
+
     def toward(
         self,
         unit: Unit,
@@ -3413,6 +3481,14 @@ class SmartTactic:
             self.memory.decision_totals["core_reinforcement:alert"] += 1
         core_acted = self._choose_beacon(turn, planner, acted_units, decisions)
         self._vacate_core_for_logistics(
+            turn,
+            planner,
+            acted_units,
+            decisions,
+        )
+        # 让路必须在 _choose_workers 之前：挡路单位这一 Tick 就离开，占用数当场
+        # 下降，工人随后才能真的寻到路，而不是等下个 Tick。
+        self._yield_path_for_blocked_workers(
             turn,
             planner,
             acted_units,
@@ -4074,6 +4150,210 @@ class SmartTactic:
             if candidates:
                 break
         return min(candidates)[-1] if candidates else None
+
+    def _worker_return_goal(self, turn: Turn, worker: Worker) -> Position | None:
+        """载货工人的回仓格：Core 迁移中时追本次迁移的目的格。"""
+
+        core = turn.core
+        if core is None:
+            return None
+        if core.view.state is CoreState.MOVING and self.memory.migration_target:
+            return self.memory.migration_target
+        return core.position
+
+    def _yield_aside_target(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        blocker: Unit,
+        path_cells: frozenset[Position],
+    ) -> Position | None:
+        """挡路单位的闪避格：优先就近让开，找不到就退到物流区外的停车位。"""
+
+        core = turn.core
+        candidates: list[tuple[int, int, int, Position]] = []
+        for direction in DIRECTION_ORDER:
+            position = _destination(blocker.position, direction)
+            if position in path_cells:
+                continue
+            if (
+                position in planner.obstacles
+                or position in planner.enemy_cells
+                or position in turn.resource_cells
+                or (core is not None and position == core.position)
+                or self.memory.temporary_blocks.get(position, 0) > turn.tick
+                or planner.final_occupancy(position) >= 2
+            ):
+                continue
+            onward_open = sum(
+                1
+                for onward_direction in DIRECTION_ORDER
+                if (onward := _destination(position, onward_direction)) not in path_cells
+                and onward not in planner.obstacles
+                and onward not in planner.enemy_cells
+                and planner.final_occupancy(onward) < 2
+            )
+            candidates.append(
+                (
+                    planner.threat.get(position, 0),
+                    -onward_open,
+                    DIRECTION_RANK[direction],
+                    position,
+                )
+            )
+        if candidates:
+            return min(candidates)[-1]
+        # 四周都堵住时借用 vacate 的停车位选择：它会避开 Core 邻格与物流走廊，
+        # 把单位推到真正不挡路的地方，toward() 会朝那里走一步。
+        return self._core_logistics_parking_target(turn, planner, blocker)
+
+    def _worker_locally_trapped(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        worker: Worker,
+        goal: Position,
+    ) -> bool:
+        """便宜的前置判断：本 Tick 没有任何可走的邻格能让工人离目标更近。
+
+        完整寻路很贵（一趟 A*），而绝大多数工人是通畅的。只有"想往前走却无路"的
+        工人才值得做地形/占用通路对比，这一步把 A* 调用量从"每个工人 2 次"压到
+        只剩真正被困住的那几个。
+        """
+
+        current = _distance(worker.position, goal)
+        for direction in DIRECTION_ORDER:
+            position = _destination(worker.position, direction)
+            if _distance(position, goal) >= current:
+                continue
+            if (
+                position in planner.obstacles
+                or position in planner.enemy_cells
+                or self.memory.temporary_blocks.get(position, 0) > turn.tick
+                or planner.final_occupancy(position) >= 2
+            ):
+                continue
+            return False
+        return True
+
+    def _yield_path_for_blocked_workers(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        """让挡路的自己人给被堵住的工人腾一步（control `yield_path_to_workers`）。
+
+        2026-08-25 实测现场（Tick 166012，人口 31、12 个战斗单位召回堆在 Core 周围）：
+        载货工人的地形通路是通的，但沿途格子被我方单位占满——每格最多 2 个实体，
+        `_blocked()` 把占满的格判为不可达，于是 `planner.toward()` 找不到完整路径、
+        退化成单步贪心，工人在两格之间来回走，货一直卸不掉。
+
+        `_vacate_core_for_logistics` 只清 Core 格与 4 个邻格，管不到更外面的走廊。
+        本方法沿工人的**地形**通路找到第一个真正占满的格子，把站在那里、本 Tick 还
+        没动作、且没载货的单位挪开一步（避开工人整条通路）；占用数掉到 2 以下后，
+        随后的 `_choose_workers` 就能正常寻路。
+
+        只在"地形通、占用不通"时触发，所以纯地形死路不会被误判成拥堵。
+        """
+
+        if not self.memory.yield_path_to_workers:
+            return
+        core = turn.core
+        if core is None:
+            return
+        if any(
+            _distance(core.position, enemy.position) <= WORKER_YIELD_CORE_THREAT_RADIUS
+            for enemy in turn.visible_enemies
+        ):
+            return
+        rescued = 0
+        # 载货的先救：它们占着仓位、又卡着物流走廊，代价最高。
+        for worker in sorted(
+            turn.workers,
+            key=lambda unit: (0 if unit.cargo else 1, unit.id.bytes),
+        ):
+            if rescued >= WORKER_YIELD_MAX_WORKERS_PER_TICK:
+                break
+            if worker.id in acted_units:
+                continue
+            if worker.cargo:
+                goal = self._worker_return_goal(turn, worker)
+            else:
+                existing_goal = self.memory.worker_goals.get(str(worker.id))
+                goal = existing_goal.position if existing_goal is not None else None
+            if goal is None or goal == worker.position:
+                continue
+            if not self._worker_locally_trapped(turn, planner, worker, goal):
+                continue
+            if planner.path_for(worker, goal):
+                continue
+            terrain_path = planner.terrain_path_for(worker, goal)
+            if not terrain_path:
+                continue
+            route = _route_positions(worker.position, terrain_path)
+            blocker_cell = next(
+                (
+                    position
+                    for position in route[1 : WORKER_YIELD_PATH_SCAN_LENGTH + 1]
+                    if planner.final_occupancy(position) >= 2
+                ),
+                None,
+            )
+            if blocker_cell is None:
+                continue
+            if self._yield_blocker_step_aside(
+                turn,
+                planner,
+                acted_units,
+                decisions,
+                worker,
+                blocker_cell,
+                frozenset(route),
+            ):
+                rescued += 1
+
+    def _yield_blocker_step_aside(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+        worker: Worker,
+        blocker_cell: Position,
+        path_cells: frozenset[Position],
+    ) -> bool:
+        """把占满格里的一个单位挪开。只需要腾出 1 个名额，成功一个就够。"""
+
+        candidates = [
+            unit
+            for unit in turn.units
+            if unit.position == blocker_cell
+            and unit.id not in acted_units
+            and not (isinstance(unit, Worker) and unit.cargo)
+        ]
+        # 战斗单位先让：空载工人挪开后往往又被自己的采集目标拉回原格。
+        candidates.sort(key=lambda unit: (isinstance(unit, Worker), unit.id.bytes))
+        for blocker in candidates:
+            target = self._yield_aside_target(turn, planner, blocker, path_cells)
+            if target is None:
+                continue
+            if planner.toward(
+                blocker,
+                target,
+                "yield_path_to_worker",
+                avoid=tuple(path_cells),
+            ):
+                acted_units.add(blocker.id)
+                decisions.append(
+                    f"{blocker.view.unit_type.value.lower()}:{_short_id(blocker.id)} "
+                    f"yield_path_to_worker worker={_short_id(worker.id)} "
+                    f"cell={blocker_cell} aside={target}"
+                )
+                self.memory.decision_totals["logistics:yield_path_to_worker"] += 1
+                return True
+        return False
 
     def _vacate_core_for_logistics(
         self,

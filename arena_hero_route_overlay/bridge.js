@@ -100,6 +100,7 @@
       "hoard_stage1",
       "hoard_stage2",
       "optimal_spawn_order",
+      "yield_path_to_workers",
     ]) {
       if (typeof payload[key] === "boolean") {
         update[key] = payload[key];

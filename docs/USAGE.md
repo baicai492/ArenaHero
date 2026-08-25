@@ -186,6 +186,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | 日志 | 显示脱敏中文事件流 |
 | 设置 | 调整目标距离、偷袭编组数量和侵略编组数量 |
 | 全局最优生产 | 补编制缺口时按兵种基础价降序生产，降低同一串产兵的总耗 |
+| 优先给工人让路 | 挡住工人去路的自己人主动闪避一步，解开走廊拥堵 |
 
 快捷键：
 
@@ -222,6 +223,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | `hoard_stage1` | boolean | 发育模式人口达 20 后先把资源攒到 95 再产兵 |
 | `hoard_stage2` | boolean | 发育模式人口达 30 后先把资源攒到 150 再产兵 |
 | `optimal_spawn_order` | boolean | 补编制缺口时改用全局资源最优顺序（游侠→先锋→工人）；关闭时用项目原顺序（先锋→游侠→工人） |
+| `yield_path_to_workers` | boolean | 工人地形上有路、却被自己人占满而寻不到路时，挡路单位主动闪避一步 |
 | `target_population` | non-negative integer | 发育编制阶梯第一级的目标人口，默认 20；0 关闭阶梯 |
 | `composition_workers` | non-negative integer | 阶梯第一级的工人配比，默认 12 |
 | `composition_vanguards` | non-negative integer | 阶梯第一级的先锋配比，默认 4 |
@@ -295,6 +297,12 @@ Invoke-RestMethod http://127.0.0.1:8765/stats
 ### Core 门口拥堵
 
 短暂 `cargo_queue_hold` 是主动排队。真正异常通常伴随连续 `UNIT_MOVE_FAILED`、`worker:cargo_stuck` 或载货距离长期不下降。策略会让占据 Core 的单位腾位，并在近端载货进入服务半径时暂停 Core 迁移。
+
+### 工人来回走、货卸不掉
+
+人口一多（尤其召回把战斗单位堆在 Core 附近），走廊会被自己人占满：每格最多 2 个实体，工人地形上有路却寻不到路，只能在两格之间来回走。打开控制字段 `yield_path_to_workers`（面板「优先给工人让路」）让挡路单位闪避一步。
+
+判断是否生效：看统计里的 `yield_path_to_worker_total` 与 `cargo_stuck_total`。让路次数上升、打转次数停止增长即为对症；打转仍在涨说明堵点在地形、临时封锁或 Core 门口，见上一节。
 
 ### API Key 无法解密
 

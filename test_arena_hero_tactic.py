@@ -9599,5 +9599,167 @@ class OptimalSpawnOrderTests(unittest.TestCase):
         self.assertEqual(action.unit_type, UnitType.RANGER)
 
 
+class WorkerYieldPathTests(unittest.TestCase):
+    """给工人让路（control `yield_path_to_workers`）。
+
+    现场（Tick 166012，人口 31、12 个战斗单位召回堆在 Core 周围）：载货工人的地形
+    通路是通的，但沿途格子被我方单位占满——每格最多 2 个实体，`_blocked()` 把占满
+    的格判为不可达，`planner.toward()` 找不到完整路径就退化成单步贪心，工人在两格
+    之间来回走，货一直卸不掉。
+    """
+
+    # 一条 1 格宽的死胡同走廊：Core(0,0) ← (1,0) ← … ← (5,0)，(3,1) 是唯一的避让
+    # 口袋。整片区域封死，保证除走廊之外没有任何绕行路线。
+    _OBSTACLES = (
+        (-1, 0),
+        (6, 0),
+        (3, 2),
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (4, 1),
+        (5, 1),
+        (0, -1),
+        (1, -1),
+        (2, -1),
+        (3, -1),
+        (4, -1),
+        (5, -1),
+    )
+
+    def _run(self, *, yield_path: bool):
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {"mode": "develop", "yield_path_to_workers": yield_path}
+                ),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (4, 0), cargo=1),
+                    # 同一格上的两个单位 = 占用 2，把 1 格宽的走廊彻底堵死
+                    vanguard((3, 0), VANGUARD_ID),
+                    vanguard((3, 0), VANGUARD_TWO_ID),
+                ),
+                obstacle_cells=self._OBSTACLES,
+                resources=0,
+            )
+            summary = SmartTactic(
+                memory, control_path=control_path
+            ).choose_actions(turn)
+        return memory, summary
+
+    def test_blocker_steps_aside_and_worker_advances(self) -> None:
+        memory, summary = self._run(yield_path=True)
+
+        self.assertTrue(
+            any("yield_path_to_worker" in item for item in summary.decisions),
+            summary.decisions,
+        )
+        # 挡路的先锋闪进口袋 (3,1)，把走廊让出来
+        aside = [
+            route
+            for route in memory.current_routes.values()
+            if route.reason == "yield_path_to_worker"
+        ]
+        self.assertEqual(len(aside), 1, aside)
+        self.assertEqual(aside[0].path[-1], (3, 1))
+        # 占用数当场下降，工人同一 Tick 就朝 Core 走进原本堵死的格子
+        worker_route = memory.current_routes.get(str(WORKER_LOW))
+        self.assertIsNotNone(worker_route)
+        self.assertEqual(worker_route.path[1], (3, 0))
+
+    def test_disabled_flag_leaves_worker_oscillating(self) -> None:
+        """关闭时复现原状：工人只能往远离 Core 的方向退，也就是来回走。"""
+
+        memory, summary = self._run(yield_path=False)
+
+        self.assertFalse(
+            any("yield_path_to_worker" in item for item in summary.decisions),
+            summary.decisions,
+        )
+        worker_route = memory.current_routes.get(str(WORKER_LOW))
+        self.assertIsNotNone(worker_route)
+        # 唯一能走的是背离 Core 的 (5,0)——占满的 (3,0) 进不去。下个 Tick 又会
+        # 被拉回 (4,0)，这就是现场看到的来回走。
+        self.assertEqual(worker_route.path[1], (5, 0))
+
+    def test_terrain_dead_end_does_not_trigger_yield(self) -> None:
+        """地形本身不通时不算被自己人堵住，不打散阵型。"""
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "yield_path_to_workers": True}),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            # 把 (3,0) 换成障碍：走廊被地形封死，且只放一个先锋（占用 1，不算堵）
+            obstacles = self._OBSTACLES + ((3, 0), (3, 1))
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (4, 0), cargo=1),
+                    vanguard((4, 0), VANGUARD_ID),
+                ),
+                obstacle_cells=obstacles,
+                resources=0,
+            )
+            summary = SmartTactic(
+                memory, control_path=control_path
+            ).choose_actions(turn)
+
+        self.assertFalse(
+            any("yield_path_to_worker" in item for item in summary.decisions),
+            summary.decisions,
+        )
+
+    def test_enemy_near_core_suspends_yielding(self) -> None:
+        """Core 近端有敌时不为物流打散阵型，生存优先。"""
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "yield_path_to_workers": True}),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (4, 0), cargo=1),
+                    vanguard((3, 0), VANGUARD_ID),
+                    vanguard((3, 0), VANGUARD_TWO_ID),
+                ),
+                enemies=(enemy_ranger((2, 0)),),
+                obstacle_cells=self._OBSTACLES,
+                resources=0,
+            )
+            summary = SmartTactic(
+                memory, control_path=control_path
+            ).choose_actions(turn)
+
+        self.assertFalse(
+            any("yield_path_to_worker" in item for item in summary.decisions),
+            summary.decisions,
+        )
+
+    def test_flag_defaults_off_and_reads_from_control(self) -> None:
+        memory = TacticMemory()
+        self.assertFalse(memory.yield_path_to_workers)
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "yield_path_to_workers": True}),
+                encoding="utf-8",
+            )
+            memory.load_control(control_path)
+        self.assertTrue(memory.yield_path_to_workers)
+
+
 if __name__ == "__main__":
     unittest.main()
