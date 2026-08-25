@@ -101,6 +101,7 @@
       "hoard_stage2",
       "optimal_spawn_order",
       "yield_path_to_workers",
+      "hoard_on_capacity",
     ]) {
       if (typeof payload[key] === "boolean") {
         update[key] = payload[key];
@@ -139,6 +140,7 @@
       "browser_hint_distance",
       "browser_scout_limit",
       "resource_leash_distance",
+      "hoard_target_after_30",
     ]) {
       if (typeof payload[key] === "number" && Number.isFinite(payload[key])) {
         update[key] = payload[key];

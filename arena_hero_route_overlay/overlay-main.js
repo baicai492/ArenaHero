@@ -27,6 +27,7 @@
     browser_hint_distance: 32,
     browser_scout_limit: 1,
     resource_leash_distance: 38,
+    hoard_target_after_30: 0,
   };
   const CONTROL_FLAG_DEFAULTS = {
     raid_enabled: false,
@@ -35,6 +36,7 @@
     hoard_stage2: false,
     optimal_spawn_order: false,
     yield_path_to_workers: false,
+    hoard_on_capacity: false,
   };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
@@ -408,6 +410,50 @@
       ? "严格下限：需攒到 水位+该单位成本，产完仍不跌破水位"
       : "解锁阈值：容量装不下 水位+最贵单位，攒到水位即放行一次";
     return `\n当前生效：囤积目标 ${stats.hoard_target} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}\n${mode}`;
+  }
+
+  // 30 之后通用水位的实时状态：它对所有模式生效，为 0 才回落两档开关。
+  function lateHoardStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.hoard_target_after_30 !== "number") {
+      return "";
+    }
+    const modeLabel = MODE_LABELS[stats.mode] || stats.mode;
+    if (stats.hoard_target_after_30 <= 0) {
+      return stats.mode === "develop"
+        ? "\n当前生效：0 = 回落上面两档开关（勾 95 就 95，勾 150 就 150）"
+        : `\n当前生效：0 = ${modeLabel}模式下没有囤积目标`;
+    }
+    const active = (stats.population ?? 0) >= 30;
+    const clamped =
+      typeof stats.capacity === "number" &&
+      stats.hoard_target_after_30 > stats.capacity;
+    const note = clamped
+      ? `（高于仓库容量 ${stats.capacity}，实际按 ${stats.hoard_target} 攒；人口涨上去后自动跟着抬）`
+      : "";
+    return active
+      ? `\n当前生效：${modeLabel}模式 · 水位 ${stats.hoard_target_after_30}${note} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}`
+      : `\n当前生效：已设 ${stats.hoard_target_after_30}，人口 ${stats.population ?? "?"} 未过 30，暂未启用`;
+  }
+
+  // 囤积容量判定的实时状态：说明当前档位是靠人口门槛还是仓库容量触发的。
+  function hoardGateStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.hoard_on_capacity !== "boolean") {
+      return "";
+    }
+    if (!stats.hoard_on_capacity) {
+      return "\n当前生效：按人口门槛判定（20 / 30，且受超产顺移影响）";
+    }
+    const target = stats.hoard_target;
+    const capacity = stats.capacity;
+    if (typeof target !== "number" || typeof capacity !== "number") {
+      return "\n当前生效：按仓库容量判定";
+    }
+    if (target <= 0) {
+      return `\n当前生效：按仓库容量判定，容量 ${capacity} 还装不下任何已开启的水位`;
+    }
+    return `\n当前生效：按仓库容量判定 · 容量 ${capacity} ≥ 水位 ${target}，先攒到 ${target}（当前 ${stats.resources ?? "?"}）`;
   }
 
   // 让路开关的实时状态：本局累计让路次数与当前卡住的工人数。
@@ -958,6 +1004,37 @@
         "\n破例放行：Core 5 格内有敌 / 守家 3先+3游 未补齐 / 灾后重建 / 工人少于 4。" +
         "\n注意：囤积生效期间会押后自动抢信标，保持在发育模式。" +
         hoardStatusText(),
+    );
+    addControlCheckbox(
+      panel,
+      "hoard_on_capacity",
+      "容量够就先攒满（不等人口门槛）",
+      () =>
+        "【develop 发育模式】把上面两档囤积的触发条件从「人口达标」改成「仓库装得下水位」。" +
+        "\n默认按人口门槛：第一档人口 20、第二档人口 30，且门槛会被超产量整体顺移。" +
+        "\n勾选后只看容量（容量 = max(10, 人口×5)）：容量 ≥ 95 就按第一档攒，≥ 150 就按第二档攒，" +
+        "与人口门槛和超产顺移都无关。" +
+        "\n为什么需要它：实测 19工7先5游（人口 31、容量 155、目标 18:6:6）时超产 2 把第二档门槛" +
+        "顺移到 32，于是生效水位还是 95——游侠缺口一补上资源就被花掉，150 永远攒不到。" +
+        "\n配比没齐也照样先攒：攒满水位之前不产兵（四类逆风情况仍然破例放行）。" +
+        "\n攒满之后一切照旧：严格下限/解锁阈值、阶梯顺序、全局最优顺序、不超产都不变。" +
+        hoardGateStatusText(),
+    );
+    addControlNumber(
+      panel,
+      "hoard_target_after_30",
+      "30 之后的攒资源目标",
+      () =>
+        "人口过 30 之后的通用囤积水位。**所有模式都生效**，不只是发育模式。" +
+        "\n0 = 发育模式下回落上面两档开关（勾了 95 就按 95，勾了 150 就按 150）；" +
+        "其它模式下 0 表示没有囤积目标。" +
+        "\n非 0（例如 300）= 人口过 30 后直接按这个值攒，覆盖两档默认值。人口不到 30 时仍走编制阶梯。" +
+        "\n水位高于仓库容量时会自动夹到容量上限，否则资源永远到不了水位 → 不产兵 → 人口不涨 →" +
+        "容量不变，会永久停产。夹住后等于先攒满仓库，人口涨上去目标自然跟着抬。" +
+        "\n攒满之后一切照旧：严格下限/解锁阈值、阶梯顺序、全局最优顺序、不超产都不变。" +
+        "\n四类逆风情况仍然破例放行：Core 5 格内有敌 / 守家 3先+3游 未补齐 / 灾后重建 / 工人少于 4。" +
+        lateHoardStatusText(),
+      { maximum: 100000, step: 5 },
     );
     addControlCheckbox(
       panel,

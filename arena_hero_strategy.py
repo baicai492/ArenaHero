@@ -496,9 +496,22 @@ CORE_LOGISTICS_CORRIDOR_LENGTH = 3
 WORKER_YIELD_MAX_WORKERS_PER_TICK = 4
 # 沿工人的地形通路往前扫这么多格找第一个真正堵死的格子。
 WORKER_YIELD_PATH_SCAN_LENGTH = 8
+# 探测寻路的展开上限。失败的 A* 要把整个搜索半径展开完才知道无解——实测 19 个
+# 工人、Core 在 38 格外时单次可展开近两万节点，每 Tick 两趟直接把 turn 算超时，
+# 服务器全部回 TICK_MISMATCH。真实通路在开阔地形下几百次展开就能找到，封顶后
+# 最坏情况也只是放弃这次让路，下个 Tick 再试。
+WORKER_YIELD_PATH_MAX_EXPANSIONS = 2000
+# 每 Tick 最多对几名工人做探测寻路（区别于上面的"最多救几名"：走不通的工人也要
+# 计入，否则一屋子被困工人仍会把 A* 调用量堆上去）。
+WORKER_YIELD_MAX_PROBES_PER_TICK = 6
 # Core 这么近有敌人时不为物流打散阵型，生存优先（与 vacate 同一条边界）。
 WORKER_YIELD_CORE_THREAT_RADIUS = 5
 DEFAULT_YIELD_PATH_TO_WORKERS = False
+# 2026-08-25 囤积档位改用容量判定：仓库装得下水位就开始攒，不等人口门槛。
+DEFAULT_HOARD_ON_CAPACITY = False
+# 2026-08-25 人口过 30 后的通用囤积水位（所有模式生效）。0 = 回落两档开关；
+# develop 之外的模式下 0 就等于没有囤积目标。
+DEFAULT_HOARD_TARGET_AFTER_30 = 0
 MIGRATION_SITE_RADIUS = 3
 MIGRATION_SITE_TOTAL_ATTACK_CELLS = 24
 MIGRATION_SITE_RANGED_ATTACK_CELLS = 16
@@ -743,23 +756,80 @@ def _composition_overflow(
     )
 
 
+def _hoard_stage_active(
+    memory: "TacticMemory",
+    population: int,
+    overflow: int,
+    capacity: int | None,
+    population_threshold: int,
+    resource_target: int,
+) -> bool:
+    """该档囤积是否生效：默认看人口门槛，勾选容量判定后改看仓库容量。"""
+
+    if population >= population_threshold + overflow:
+        return True
+    # 2026-08-25 `hoard_on_capacity`：仓库一旦装得下水位就开始攒，不再等人口门槛，
+    # 也不受超产顺移影响。实测 19工7先5游（人口 31、容量 155、目标 18:6:6）时，
+    # 超产 2 把第二档门槛顺移到 32，于是生效水位还是 95，游侠缺口一补上资源就被
+    # 花掉、始终攒不到 150。容量判定下 155 >= 150 立刻按第二档攒。
+    return (
+        memory.hoard_on_capacity
+        and capacity is not None
+        and capacity >= resource_target
+    )
+
+
 def _hoard_resource_target(
-    memory: "TacticMemory", population: int, overflow: int = 0
+    memory: "TacticMemory",
+    population: int,
+    overflow: int = 0,
+    capacity: int | None = None,
 ) -> int:
     """返回当前人口下的资源囤积目标；0 表示不囤积。
 
-    仅 develop 发育模式生效。两档开关互相独立，同时命中时取较高目标，因此只开
-    第一档也能在人口 30 之后继续维持 95 的水位。overflow 是超产数量，会把人口
-    门槛整体顺移，让被多产挤掉的编制缺口先补齐（见 _composition_overflow）。
+    优先级：人口过 30 后，控制文件 `hoard_target_after_30` 非 0 就直接用它，且
+    **所有模式生效**——这是一条与发育阶梯无关的通用水位。为 0 时才回落到两档开关，
+    而两档只在 develop 生效；因此其它模式下把它设为 0 就等于没有囤积目标。
+
+    两档开关互相独立，同时命中时取较高目标，因此只开第一档也能在人口 30 之后继续
+    维持 95 的水位。overflow 是超产数量，会把人口门槛整体顺移，让被多产挤掉的编制
+    缺口先补齐（见 _composition_overflow）。
+
+    勾选 `hoard_on_capacity` 后改用容量判定：仓库装得下水位就开始攒，与人口门槛
+    和超产顺移无关。攒满之后一切照旧——严格下限/解锁阈值、阶梯顺序、不超产都不变。
     """
 
-    if memory.mode != MODE_DEVELOP:
-        return 0
     target = 0
-    if memory.hoard_stage1 and population >= HOARD_STAGE1_POPULATION + overflow:
-        target = HOARD_STAGE1_RESOURCE_TARGET
-    if memory.hoard_stage2 and population >= HOARD_STAGE2_POPULATION + overflow:
-        target = max(target, HOARD_STAGE2_RESOURCE_TARGET)
+    if (
+        memory.hoard_target_after_30 > 0
+        and population >= HOARD_STAGE2_POPULATION
+    ):
+        target = memory.hoard_target_after_30
+    elif memory.mode == MODE_DEVELOP:
+        if memory.hoard_stage1 and _hoard_stage_active(
+            memory,
+            population,
+            overflow,
+            capacity,
+            HOARD_STAGE1_POPULATION,
+            HOARD_STAGE1_RESOURCE_TARGET,
+        ):
+            target = HOARD_STAGE1_RESOURCE_TARGET
+        if memory.hoard_stage2 and _hoard_stage_active(
+            memory,
+            population,
+            overflow,
+            capacity,
+            HOARD_STAGE2_POPULATION,
+            HOARD_STAGE2_RESOURCE_TARGET,
+        ):
+            target = max(target, HOARD_STAGE2_RESOURCE_TARGET)
+    if target <= 0:
+        return 0
+    if capacity is not None:
+        # 水位高于仓库容量会永久停产：资源永远到不了水位 → 不产兵 → 人口不涨 →
+        # 容量不变，死锁。夹到容量上限＝先攒满仓库，人口涨上去后目标自然跟着抬。
+        target = min(target, capacity)
     return target
 
 
@@ -942,6 +1012,10 @@ class TacticMemory:
     optimal_spawn_order: bool = DEFAULT_OPTIMAL_SPAWN_ORDER
     # 2026-08-25 给工人让路（control 配置）：挡路的自己人主动挪开一步。
     yield_path_to_workers: bool = DEFAULT_YIELD_PATH_TO_WORKERS
+    # 2026-08-25 囤积改用容量判定（control 配置）：仓库装得下水位就开始攒。
+    hoard_on_capacity: bool = DEFAULT_HOARD_ON_CAPACITY
+    # 2026-08-25 人口过 30 后的通用囤积水位（control 配置），所有模式生效。
+    hoard_target_after_30: int = DEFAULT_HOARD_TARGET_AFTER_30
     # 2026-08-24 浏览器水晶提示的搜索半径（control 配置），0 表示不使用提示。
     browser_hint_distance: int = DEFAULT_BROWSER_HINT_DISTANCE
     # 2026-08-24 每 Tick 最多派几名工人验证浏览器提示（control 配置）。
@@ -2209,6 +2283,9 @@ class TacticMemory:
             self.yield_path_to_workers = bool(
                 data.get("yield_path_to_workers", self.yield_path_to_workers)
             )
+            self.hoard_on_capacity = bool(
+                data.get("hoard_on_capacity", self.hoard_on_capacity)
+            )
             for key in (
                 "target_population",
                 "composition_workers",
@@ -2220,6 +2297,7 @@ class TacticMemory:
                 "browser_hint_distance",
                 "browser_scout_limit",
                 "resource_leash_distance",
+                "hoard_target_after_30",
             ):
                 raw_value = data.get(key)
                 if isinstance(raw_value, (int, float)) and not isinstance(
@@ -2492,16 +2570,23 @@ class TacticMemory:
                 "hoard_stage1": self.hoard_stage1,
                 "hoard_stage2": self.hoard_stage2,
                 "hoard_target": _hoard_resource_target(
-                    self, len(turn.units), stats_overflow
+                    self, len(turn.units), stats_overflow, turn.resource_capacity
                 ),
                 # 严格模式：容量能同时容纳水位与最贵单位时，水位是产兵后的真下限
                 # （需攒到 水位+成本）；否则退回"攒到水位放行一次"的解锁阈值。
                 "hoard_strict": bool(
-                    _hoard_resource_target(self, len(turn.units), stats_overflow) > 0
+                    _hoard_resource_target(
+                        self, len(turn.units), stats_overflow, turn.resource_capacity
+                    )
+                    > 0
                     and turn.resource_capacity
-                    >= _hoard_resource_target(self, len(turn.units), stats_overflow)
+                    >= _hoard_resource_target(
+                        self, len(turn.units), stats_overflow, turn.resource_capacity
+                    )
                     + unit_cost(UnitType.RANGER, len(turn.units))
                 ),
+                "hoard_on_capacity": self.hoard_on_capacity,
+                "hoard_target_after_30": self.hoard_target_after_30,
                 "target_population": self.target_population,
                 "composition_workers": self.composition_workers,
                 "composition_vanguards": self.composition_vanguards,
@@ -3206,11 +3291,15 @@ class MovementPlanner:
         goal: Position,
         *,
         avoid: Iterable[Position] = (),
+        max_expansions: int = 30000,
     ) -> tuple[Direction, ...]:
         """当前占用情况下的完整寻路结果；空元组表示这一 Tick 走不通。
 
         `toward()` 走不通时会退化成单步贪心，从外面看不出是"没路"还是"绕路"。
         让路逻辑需要区分这两者，所以把寻路本身暴露出来。
+
+        `max_expansions` 供纯探测的调用收紧上限：失败的 A* 要把整个搜索半径展开完
+        才知道无解，是最贵的一种调用，探测场景必须封顶。
         """
 
         return _find_path(
@@ -3219,9 +3308,16 @@ class MovementPlanner:
             blocked=self._blocked(unit, goal, frozenset(avoid)),
             threat=self.threat,
             visited=self.memory.visited,
+            max_expansions=max_expansions,
         )
 
-    def terrain_path_for(self, unit: Unit, goal: Position) -> tuple[Direction, ...]:
+    def terrain_path_for(
+        self,
+        unit: Unit,
+        goal: Position,
+        *,
+        max_expansions: int = 30000,
+    ) -> tuple[Direction, ...]:
         """只看地形、敌人与临时封锁的寻路结果，忽略我方单位占用。
 
         与 `path_for()` 一起用：地形通、占用不通 = 被自己人堵住。
@@ -3239,6 +3335,7 @@ class MovementPlanner:
             blocked=blocked,
             threat=self.threat,
             visited=self.memory.visited,
+            max_expansions=max_expansions,
         )
 
     def toward(
@@ -4269,12 +4366,15 @@ class SmartTactic:
         ):
             return
         rescued = 0
+        probes = 0
         # 载货的先救：它们占着仓位、又卡着物流走廊，代价最高。
         for worker in sorted(
             turn.workers,
             key=lambda unit: (0 if unit.cargo else 1, unit.id.bytes),
         ):
             if rescued >= WORKER_YIELD_MAX_WORKERS_PER_TICK:
+                break
+            if probes >= WORKER_YIELD_MAX_PROBES_PER_TICK:
                 break
             if worker.id in acted_units:
                 continue
@@ -4287,9 +4387,18 @@ class SmartTactic:
                 continue
             if not self._worker_locally_trapped(turn, planner, worker, goal):
                 continue
-            if planner.path_for(worker, goal):
+            probes += 1
+            if planner.path_for(
+                worker,
+                goal,
+                max_expansions=WORKER_YIELD_PATH_MAX_EXPANSIONS,
+            ):
                 continue
-            terrain_path = planner.terrain_path_for(worker, goal)
+            terrain_path = planner.terrain_path_for(
+                worker,
+                goal,
+                max_expansions=WORKER_YIELD_PATH_MAX_EXPANSIONS,
+            )
             if not terrain_path:
                 continue
             route = _route_positions(worker.position, terrain_path)
@@ -6894,6 +7003,7 @@ class SmartTactic:
                 self.memory,
                 len(turn.units),
                 _composition_overflow(self.memory, *expedition_counts),
+                turn.resource_capacity,
             )
             > 0
         ):
@@ -11349,7 +11459,10 @@ class SmartTactic:
         # 四类逆风情况破例放行——攒资源是顺风局的优化，逆风时高库存只会变成敌方
         # 斩首的战利品（摧毁 Core 会转移其库存资源）。
         hoard_target = _hoard_resource_target(
-            self.memory, current_population, composition_overflow
+            self.memory,
+            current_population,
+            composition_overflow,
+            turn.resource_capacity,
         )
         hoard_override = (
             near_threat
@@ -11601,6 +11714,13 @@ class SmartTactic:
             if fallback_pick is not None:
                 return fallback_pick
             return continuous_growth_spawn(develop_growth_profile)
+
+        # 30 之后的通用水位（hoard_target_after_30）对所有模式生效。develop 分支
+        # 内部另有更细的放行顺序（开局底线、遇袭响应先走），所以只在其它模式做集中
+        # 拦截；hoard_override 已经覆盖了工人不足 4、守军缺口、近端威胁与灾后重建，
+        # 那些情况根本不会走到这里。
+        if hoard_block and mode != MODE_DEVELOP:
+            return None
 
         if mode == MODE_AGGRESS:
             replacement_costs = (

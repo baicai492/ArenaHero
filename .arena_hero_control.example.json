@@ -16,6 +16,7 @@
   "hoard_stage2": false,
   "optimal_spawn_order": false,
   "yield_path_to_workers": false,
+  "hoard_on_capacity": false,
   "target_population": 20,
   "composition_workers": 12,
   "composition_vanguards": 4,
@@ -25,5 +26,6 @@
   "growth_rangers": 6,
   "browser_hint_distance": 32,
   "browser_scout_limit": 1,
-  "resource_leash_distance": 38
+  "resource_leash_distance": 38,
+  "hoard_target_after_30": 0
 }

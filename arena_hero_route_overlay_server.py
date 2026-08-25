@@ -28,6 +28,7 @@ CONTROL_NUMBER_DEFAULTS = {
     "browser_hint_distance": 32,
     "browser_scout_limit": 1,
     "resource_leash_distance": 38,
+    "hoard_target_after_30": 0,
 }
 CONTROL_FLAG_DEFAULTS = {
     "raid_enabled": False,
@@ -37,6 +38,7 @@ CONTROL_FLAG_DEFAULTS = {
     "hoard_stage2": False,
     "optimal_spawn_order": False,
     "yield_path_to_workers": False,
+    "hoard_on_capacity": False,
 }
 EMPTY_ROUTES = {
     "version": 2,
@@ -75,6 +77,8 @@ EMPTY_STATS = {
     "growth_rangers": 6,
     "optimal_spawn_order": False,
     "yield_path_to_workers": False,
+    "hoard_on_capacity": False,
+    "hoard_target_after_30": 0,
     "effective_growth_workers": 5,
     "effective_growth_vanguards": 4,
     "effective_growth_rangers": 6,

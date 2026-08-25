@@ -9761,5 +9761,135 @@ class WorkerYieldPathTests(unittest.TestCase):
         self.assertTrue(memory.yield_path_to_workers)
 
 
+class HoardGateTests(unittest.TestCase):
+    """囤积触发条件：容量判定（`hoard_on_capacity`）与 30 之后的通用水位。"""
+
+    def _develop_memory(self) -> TacticMemory:
+        memory = TacticMemory()
+        memory.mode = MODE_DEVELOP
+        memory.hoard_stage1 = True
+        memory.hoard_stage2 = True
+        return memory
+
+    def test_capacity_gate_defeats_overflow_shift(self) -> None:
+        """回归：超产把人口门槛顺移后，第二档水位再也攒不到。
+
+        现场 19工7先5游（人口 31、容量 155、目标 18:6:6）：超产 2 把第二档门槛顺移
+        到 32，于是生效水位还是 95——游侠缺口一补上资源就被花掉，150 永远攒不到。
+        容量判定下 155 >= 150 立刻按第二档攒。
+        """
+
+        memory = self._develop_memory()
+        self.assertEqual(_hoard_resource_target(memory, 31, 2, 155), 95)
+        memory.hoard_on_capacity = True
+        self.assertEqual(_hoard_resource_target(memory, 31, 2, 155), 150)
+
+    def test_capacity_gate_starts_before_population_threshold(self) -> None:
+        """容量判定不等人口门槛：人口 19 容量已经 95 就开始攒。"""
+
+        memory = self._develop_memory()
+        self.assertEqual(core_resource_capacity(19), 95)
+        self.assertEqual(_hoard_resource_target(memory, 19, 0, 95), 0)
+        memory.hoard_on_capacity = True
+        self.assertEqual(_hoard_resource_target(memory, 19, 0, 95), 95)
+
+    def test_capacity_gate_needs_capacity_to_hold_the_line(self) -> None:
+        """仓库还装不下水位时容量判定也不生效。"""
+
+        memory = self._develop_memory()
+        memory.hoard_on_capacity = True
+        self.assertEqual(_hoard_resource_target(memory, 10, 0, 50), 0)
+
+    def test_late_target_overrides_both_stages(self) -> None:
+        memory = self._develop_memory()
+        memory.hoard_target_after_30 = 300
+        self.assertEqual(_hoard_resource_target(memory, 31, 2, 400), 300)
+
+    def test_late_target_ignored_below_population_30(self) -> None:
+        """人口不到 30 仍按编制阶梯的两档水位。"""
+
+        memory = self._develop_memory()
+        memory.hoard_target_after_30 = 300
+        self.assertEqual(_hoard_resource_target(memory, 25, 0, 125), 95)
+
+    def test_late_target_zero_falls_back_to_stage_flags(self) -> None:
+        memory = self._develop_memory()
+        memory.hoard_target_after_30 = 0
+        self.assertEqual(_hoard_resource_target(memory, 30, 0, 150), 150)
+        memory.hoard_stage2 = False
+        self.assertEqual(_hoard_resource_target(memory, 30, 0, 150), 95)
+
+    def test_late_target_applies_to_every_mode(self) -> None:
+        """两档只在 develop 生效，30 之后的通用水位所有模式都生效。"""
+
+        for mode in (MODE_DEVELOP, MODE_AGGRESS, MODE_BEACON):
+            with self.subTest(mode=mode):
+                memory = TacticMemory()
+                memory.mode = mode
+                memory.hoard_stage1 = True
+                memory.hoard_stage2 = True
+                # 未设通用水位时，非 develop 模式没有任何囤积目标
+                expected = 150 if mode == MODE_DEVELOP else 0
+                self.assertEqual(
+                    _hoard_resource_target(memory, 40, 0, 250), expected
+                )
+                memory.hoard_target_after_30 = 200
+                self.assertEqual(
+                    _hoard_resource_target(memory, 40, 0, 250), 200
+                )
+
+    def test_target_is_clamped_to_capacity(self) -> None:
+        """回归：水位高于容量会永久停产，必须夹到容量上限。
+
+        资源永远到不了水位 → 不产兵 → 人口不涨 → 容量不变，死锁。夹住后等于先攒满
+        仓库，人口涨上去后目标自然跟着抬。
+        """
+
+        memory = self._develop_memory()
+        memory.hoard_target_after_30 = 300
+        self.assertEqual(_hoard_resource_target(memory, 31, 0, 155), 155)
+        self.assertEqual(_hoard_resource_target(memory, 60, 0, 300), 300)
+
+    def test_late_target_blocks_spawn_in_aggress_mode(self) -> None:
+        """通用水位在 aggress 模式下也真的拦住产兵。"""
+
+        roster = ResourceHoardTests._develop_roster(self, 20, 10, 10)
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "aggress", "hoard_target_after_30": 200}),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=roster,
+                resources=150,
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(
+                turn
+            )
+        self.assertNotIsInstance(turn.plan.core_action, SpawnAction)
+
+    def test_reads_both_controls(self) -> None:
+        memory = TacticMemory()
+        self.assertFalse(memory.hoard_on_capacity)
+        self.assertEqual(memory.hoard_target_after_30, 0)
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "develop",
+                        "hoard_on_capacity": True,
+                        "hoard_target_after_30": 300,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            memory.load_control(control_path)
+        self.assertTrue(memory.hoard_on_capacity)
+        self.assertEqual(memory.hoard_target_after_30, 300)
+
+
 if __name__ == "__main__":
     unittest.main()
