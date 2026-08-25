@@ -6257,10 +6257,11 @@ class ModeAndRecallTests(unittest.TestCase):
             )
         )
         self.assertIsInstance(turn.plan.core_action, SpawnAction)
-        # 2026-08-24 召回期间也沿用面板配置的编制阶梯（默认 12:4:4）。
-        # 4工3先3游 下工人比压 4/12 最低，因此补工人；此前不传 profile 退回
-        # 默认 5:4:6，游侠比压最低而产游侠，违背面板设定。
-        self.assertEqual(turn.plan.core_action.unit_type, UnitType.WORKER)
+        # 2026-08-24 召回期间也沿用面板配置的编制阶梯（默认 12:4:4），且按严格
+        # 优先级补缺口：4工3先3游 下先锋差 1，顺序 先锋 → 游侠 → 工人，因此补
+        # 先锋。此前这里走 continuous_growth_spawn 的比压容差，工人比压 4/12 最
+        # 低而产工人，会在战斗缺口没补齐时先扩经济。
+        self.assertEqual(turn.plan.core_action.unit_type, UnitType.VANGUARD)
 
     def test_recall_follows_ladder_composition(self) -> None:
         """回归：手动召回不得让编制阶梯失效。
@@ -9296,16 +9297,20 @@ class ResourceHoardTests(unittest.TestCase):
                 f"资源 {resources} 不足 水位+成本，不应产兵",
             )
 
-        # 攒到 水位+工人成本 → 放行工人
-        action = self._spawn_for(
-            resources=target + worker_cost,
-            control={"mode": "develop", "hoard_stage1": True},
-            workers=roster[0],
-            vanguards=roster[1],
-            rangers=roster[2],
+        # 2026-08-24 严格优先级：先锋缺口没补齐前，即使已经攒够工人的
+        # 水位+成本 也不放行工人。买便宜的插队会把贵的挤到更高倍率的位置，
+        # 总花费反而更高，也违背"严格按设定配比补齐"。
+        self.assertNotIsInstance(
+            self._spawn_for(
+                resources=target + worker_cost,
+                control={"mode": "develop", "hoard_stage1": True},
+                workers=roster[0],
+                vanguards=roster[1],
+                rangers=roster[2],
+            ),
+            SpawnAction,
+            "先锋缺口未补齐时不应先产工人",
         )
-        self.assertIsInstance(action, SpawnAction)
-        self.assertEqual(action.unit_type, UnitType.WORKER)
 
         # 攒到 水位+先锋成本 → 按阶梯顺序优先补先锋
         action = self._spawn_for(
@@ -9320,6 +9325,26 @@ class ResourceHoardTests(unittest.TestCase):
         # 产完仍不跌破水位
         self.assertGreaterEqual(target + vanguard_cost - vanguard_cost, target)
         self.assertLess(ranger_cost + target, core_resource_capacity(population) + 1)
+
+        # 三个兵种都达标后才轮到工人：此时只剩工人有缺口。人口变了，成本也变，
+        # 所以按新人口重新取价，不能复用上面 23 人时的 worker_cost。
+        filled_roster = (16, COMPOSITION_STAGE2_VANGUARDS, COMPOSITION_STAGE2_RANGERS)
+        filled_population = sum(filled_roster)
+        filled_worker_cost = unit_cost(UnitType.WORKER, filled_population)
+        self.assertGreaterEqual(
+            core_resource_capacity(filled_population),
+            target + unit_cost(UnitType.RANGER, filled_population),
+            "该人口下仍应处于严格下限模式",
+        )
+        action = self._spawn_for(
+            resources=target + filled_worker_cost,
+            control={"mode": "develop", "hoard_stage1": True},
+            workers=filled_roster[0],
+            vanguards=filled_roster[1],
+            rangers=filled_roster[2],
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.WORKER)
 
     def test_strict_mode_falls_back_when_capacity_too_small(self) -> None:
         """容量装不下 水位+最贵单位 时退回解锁阈值，否则会永久停产。
@@ -9392,6 +9417,186 @@ class ResourceHoardTests(unittest.TestCase):
             rangers=4,
         )
         self.assertIsInstance(action, SpawnAction)
+
+
+class OptimalSpawnOrderTests(unittest.TestCase):
+    """全局最优生产顺序（control `optimal_spawn_order`）与严格不超产。"""
+
+    _spawn_for = ResourceHoardTests._spawn_for
+    _develop_roster = ResourceHoardTests._develop_roster
+
+    def test_flag_defaults_off_and_reads_from_control(self) -> None:
+        memory = TacticMemory()
+        self.assertFalse(memory.optimal_spawn_order)
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "optimal_spawn_order": True}),
+                encoding="utf-8",
+            )
+            memory.load_control(control_path)
+        self.assertTrue(memory.optimal_spawn_order)
+
+    def test_order_flips_to_descending_base_cost(self) -> None:
+        """同一缺口下，勾选后先补贵的游侠而不是先锋。
+
+        unit_cost 只按产兵前人口取倍率，与兵种无关，所以把贵的排在倍率低的早期
+        位置总花费最低：游侠(12) → 先锋(10) → 工人(5)。关闭时沿用项目原顺序
+        先锋 → 游侠 → 工人。
+        """
+
+        # 12工3先3游 = 18 人，目标 12:4:4：先锋与游侠各差 1，资源足够买任意一个
+        roster = {"workers": 12, "vanguards": 3, "rangers": 3}
+        default_action = self._spawn_for(
+            resources=60, control={"mode": "develop"}, **roster
+        )
+        self.assertIsInstance(default_action, SpawnAction)
+        self.assertEqual(default_action.unit_type, UnitType.VANGUARD)
+
+        optimal_action = self._spawn_for(
+            resources=60,
+            control={"mode": "develop", "optimal_spawn_order": True},
+            **roster,
+        )
+        self.assertIsInstance(optimal_action, SpawnAction)
+        self.assertEqual(optimal_action.unit_type, UnitType.RANGER)
+
+    def test_met_roles_are_never_overproduced(self) -> None:
+        """回归：达标或超产的兵种一个都不再加，只补还有缺口的。
+
+        用户实测 19工7先5游（目标 18:6:6）：工人和先锋都已超产，游侠还差 1。
+        此前 develop 与召回两条路径都用 continuous_growth_spawn 的 0.20 比压容差，
+        便宜的工人在贵的买不起时插队，于是超产越堆越多、游侠缺口始终没补上。
+        """
+
+        for optimal in (False, True):
+            with self.subTest(optimal_spawn_order=optimal):
+                action = self._spawn_for(
+                    resources=200,
+                    control={
+                        "mode": "develop",
+                        "optimal_spawn_order": optimal,
+                    },
+                    workers=19,
+                    vanguards=7,
+                    rangers=5,
+                )
+                self.assertIsInstance(action, SpawnAction)
+                self.assertEqual(action.unit_type, UnitType.RANGER)
+
+    def test_overflow_roster_fills_ranger_before_stage_two_hoard(self) -> None:
+        """19工7先5游 + 勾选两档囤积：先把游侠补到 6，之后才进入 150 的攒。
+
+        超产 2（工人 1 + 先锋 1）会把第二档门槛从 30 顺移到 32，所以人口 31 时
+        生效水位仍是第一档的 95，游侠缺口能立刻补上；补齐后人口 32 才开始攒 150。
+        """
+
+        memory = TacticMemory()
+        memory.mode = MODE_DEVELOP
+        memory.hoard_stage1 = True
+        memory.hoard_stage2 = True
+
+        # 补齐前：目标编制是第二级 18:6:6，超产 2
+        self.assertEqual(_effective_composition(memory, 19, 7, 5), (18, 6, 6))
+        self.assertEqual(_composition_overflow(memory, 19, 7, 5), 2)
+
+        action = self._spawn_for(
+            resources=HOARD_STAGE1_RESOURCE_TARGET + 40,
+            control={
+                "mode": "develop",
+                "hoard_stage1": True,
+                "hoard_stage2": True,
+                "optimal_spawn_order": True,
+            },
+            workers=19,
+            vanguards=7,
+            rangers=5,
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.RANGER)
+
+        # 游侠补到 6 后编制达成，第二档水位（门槛 30+2）开始生效
+        self.assertEqual(
+            _hoard_resource_target(memory, 32, _composition_overflow(memory, 19, 7, 6)),
+            HOARD_STAGE2_RESOURCE_TARGET,
+        )
+
+    def test_hoard_gate_uses_next_optimal_unit_cost(self) -> None:
+        """勾选全局最优后，放行线是 水位 + 该顺序下一个要产单位的成本。
+
+        18工6先5游、目标 18:6:6 时只差游侠。资源刚好 水位+游侠成本 才放行；
+        少 1 就继续攒，不会退而去买便宜单位。
+        """
+
+        population = 29
+        ranger_cost = unit_cost(UnitType.RANGER, population)
+        target = HOARD_STAGE1_RESOURCE_TARGET
+        self.assertGreaterEqual(
+            core_resource_capacity(population),
+            target + ranger_cost,
+            "该人口下应处于严格下限模式",
+        )
+        control = {
+            "mode": "develop",
+            "hoard_stage1": True,
+            "optimal_spawn_order": True,
+        }
+        roster = {"workers": 18, "vanguards": 6, "rangers": 5}
+
+        self.assertNotIsInstance(
+            self._spawn_for(
+                resources=target + ranger_cost - 1, control=control, **roster
+            ),
+            SpawnAction,
+            "差 1 资源就应继续攒，不产便宜单位",
+        )
+        action = self._spawn_for(
+            resources=target + ranger_cost, control=control, **roster
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.RANGER)
+
+    def test_recall_uses_optimal_order(self) -> None:
+        """召回期间同样按全局最优顺序补阶梯缺口。"""
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "develop",
+                        "recall": True,
+                        "optimal_spawn_order": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=self._develop_roster(12, 3, 3),
+                resources=60,
+            )
+            SmartTactic(TacticMemory(), control_path=control_path).choose_actions(turn)
+        action = turn.plan.core_action
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.RANGER)
+
+    def test_continuous_growth_prefers_dearest_within_slack(self) -> None:
+        """阶梯用尽后的连续增长也走全局最优：容差内的候选里挑最贵的。"""
+
+        control = {
+            "mode": "develop",
+            "target_population": 0,
+            "optimal_spawn_order": True,
+        }
+        # 阶梯关闭 → 项目原编制 12工4先5游 已达成，进入 5:4:6 连续增长。
+        # 15工12先18游 时三者比压 3.0 / 3.0 / 3.0 完全相等，容差内三种都可选，
+        # 全局最优应挑最贵的游侠。
+        action = self._spawn_for(
+            resources=300, control=control, workers=15, vanguards=12, rangers=18
+        )
+        self.assertIsInstance(action, SpawnAction)
+        self.assertEqual(action.unit_type, UnitType.RANGER)
 
 
 if __name__ == "__main__":

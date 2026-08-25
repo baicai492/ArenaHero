@@ -99,6 +99,7 @@
       "raid_recall",
       "hoard_stage1",
       "hoard_stage2",
+      "optimal_spawn_order",
     ]) {
       if (typeof payload[key] === "boolean") {
         update[key] = payload[key];

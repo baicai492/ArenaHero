@@ -33,6 +33,7 @@
     raid_recall: false,
     hoard_stage1: false,
     hoard_stage2: false,
+    optimal_spawn_order: false,
   };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
@@ -406,6 +407,18 @@
       ? "严格下限：需攒到 水位+该单位成本，产完仍不跌破水位"
       : "解锁阈值：容量装不下 水位+最贵单位，攒到水位即放行一次";
     return `\n当前生效：囤积目标 ${stats.hoard_target} · 当前 ${stats.resources ?? "?"}/${stats.capacity ?? "?"}\n${mode}`;
+  }
+
+  // 全局最优生产顺序的实时状态：说明当前按哪个顺序补缺口。
+  function optimalOrderStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.optimal_spawn_order !== "boolean") {
+      return "";
+    }
+    const order = stats.optimal_spawn_order
+      ? "游侠 → 先锋 → 工人（基础价降序，全局最省）"
+      : "先锋 → 游侠 → 工人（项目原顺序）";
+    return `\n当前生效：补缺口顺序 ${order}`;
   }
 
   // 编制阶梯的四个输入框显示"当前实际生效的那一级"，而不是控制文件里的原始
@@ -923,6 +936,22 @@
         "\n破例放行：Core 5 格内有敌 / 守家 3先+3游 未补齐 / 灾后重建 / 工人少于 4。" +
         "\n注意：囤积生效期间会押后自动抢信标，保持在发育模式。" +
         hoardStatusText(),
+    );
+    addControlCheckbox(
+      panel,
+      "optimal_spawn_order",
+      "全局最优生产",
+      () =>
+        "【develop 发育模式】朝当前目标人口与配比补缺口时，改用全局资源最优的兵种顺序。" +
+        "\n原理：unit_cost 只按产兵前人口取倍率，与兵种无关，所以一串产兵的总花费 = Σ 基础价 × 该位置倍率。" +
+        "\n倍率随人口只增不减，把贵的排在倍率低的早期位置、便宜的垫到最后总花费最低，" +
+        "因此顺序按基础价降序：游侠(12) → 先锋(10) → 工人(5)。" +
+        "\n不勾选时沿用项目原顺序 先锋 → 游侠 → 工人（局部直觉顺序，总耗更高）。" +
+        "\n两种顺序都严格按设定补缺口：已达标的兵种一个都不多产，缺的兵种买不起就等，" +
+        "不会拿刚攒起来的资源去买便宜单位插队。" +
+        "\n已经超产时暂时允许总数到 目标+超产量：只补还没达标的兵种，达标或超出的不再增加。" +
+        "\n与囤积叠加时的放行线是 水位 + 该顺序下一个要产单位的成本。" +
+        optimalOrderStatusText(),
     );
     addControlNumber(
       panel,

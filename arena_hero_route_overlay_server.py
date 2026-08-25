@@ -35,6 +35,7 @@ CONTROL_FLAG_DEFAULTS = {
     "ally_support_enabled": False,
     "hoard_stage1": False,
     "hoard_stage2": False,
+    "optimal_spawn_order": False,
 }
 EMPTY_ROUTES = {
     "version": 2,
@@ -71,6 +72,7 @@ EMPTY_STATS = {
     "growth_workers": 5,
     "growth_vanguards": 4,
     "growth_rangers": 6,
+    "optimal_spawn_order": False,
     "effective_growth_workers": 5,
     "effective_growth_vanguards": 4,
     "effective_growth_rangers": 6,

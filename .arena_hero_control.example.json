@@ -14,6 +14,7 @@
   "ally_support_enabled": false,
   "hoard_stage1": false,
   "hoard_stage2": false,
+  "optimal_spawn_order": false,
   "target_population": 20,
   "composition_workers": 12,
   "composition_vanguards": 4,

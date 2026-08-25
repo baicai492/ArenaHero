@@ -13,6 +13,7 @@ from typing import Iterable
 from uuid import UUID
 
 from arena_hero import (
+    UNIT_BASE_COSTS,
     BeaconStatus,
     CoreState,
     CoreView,
@@ -297,6 +298,10 @@ COMPOSITION_STAGE2_RANGERS = 6
 DEFAULT_GROWTH_WORKERS = 5
 DEFAULT_GROWTH_VANGUARDS = 4
 DEFAULT_GROWTH_RANGERS = 6
+# 全局最优生产顺序。unit_cost 只按产兵前人口取倍率，与兵种无关，所以一串产兵的
+# 总花费 = Σ 基础价 × 该位置的倍率；倍率随人口单调递增，把贵的排在前面（低倍率
+# 位置）、便宜的垫后总花费最低。关闭时沿用项目原顺序 先锋 → 游侠 → 工人。
+DEFAULT_OPTIMAL_SPAWN_ORDER = False
 # Once the Beacon home screen has five Vanguards, preserve the next affordable
 # resource window for the cheaper pre-population-20 Ranger instead of filling
 # a sixth/eighth Vanguard first.
@@ -923,6 +928,8 @@ class TacticMemory:
     growth_workers: int = DEFAULT_GROWTH_WORKERS
     growth_vanguards: int = DEFAULT_GROWTH_VANGUARDS
     growth_rangers: int = DEFAULT_GROWTH_RANGERS
+    # 2026-08-24 全局最优生产顺序（control 配置）：按基础价降序补缺口。
+    optimal_spawn_order: bool = DEFAULT_OPTIMAL_SPAWN_ORDER
     # 2026-08-24 浏览器水晶提示的搜索半径（control 配置），0 表示不使用提示。
     browser_hint_distance: int = DEFAULT_BROWSER_HINT_DISTANCE
     # 2026-08-24 每 Tick 最多派几名工人验证浏览器提示（control 配置）。
@@ -2184,6 +2191,9 @@ class TacticMemory:
             # 2026-08-24 资源囤积开关与自定义编制。
             self.hoard_stage1 = bool(data.get("hoard_stage1", self.hoard_stage1))
             self.hoard_stage2 = bool(data.get("hoard_stage2", self.hoard_stage2))
+            self.optimal_spawn_order = bool(
+                data.get("optimal_spawn_order", self.optimal_spawn_order)
+            )
             for key in (
                 "target_population",
                 "composition_workers",
@@ -2484,6 +2494,7 @@ class TacticMemory:
                 "growth_workers": self.growth_workers,
                 "growth_vanguards": self.growth_vanguards,
                 "growth_rangers": self.growth_rangers,
+                "optimal_spawn_order": self.optimal_spawn_order,
                 # 当前实际用于连续增长的权重（阶梯生效时是本级编制，用尽后是
                 # growth_*），面板 tooltip 直接显示。
                 "effective_growth_workers": stats_growth.get(UnitType.WORKER, 0),
@@ -11150,12 +11161,56 @@ class SmartTactic:
                 key=lambda item: counts[item[0]] / item[1],
             )
             minimum_pressure = counts[ranked_profile[0][0]] / ranked_profile[0][1]
-            for unit_type, weight in ranked_profile:
-                pressure = counts[unit_type] / weight
-                if pressure > minimum_pressure + CONTINUOUS_GROWTH_PRESSURE_SLACK:
-                    break
+            candidates = [
+                unit_type
+                for unit_type, weight in ranked_profile
+                if counts[unit_type] / weight
+                <= minimum_pressure + CONTINUOUS_GROWTH_PRESSURE_SLACK
+            ]
+            if self.memory.optimal_spawn_order:
+                # 全局最优：unit_cost 只看产兵前人口，与兵种无关，所以总花费 =
+                # Σ 基础价 × 位置倍率。倍率只随人口单增，把贵的排在前面（低倍率
+                # 位置）、便宜的垫后最省。容差内的候选里优先挑最贵的。
+                candidates.sort(key=lambda unit: -UNIT_BASE_COSTS[unit])
+            for unit_type in candidates:
                 if budget >= costs[unit_type]:
                     return unit_type
+            return None
+
+        def ladder_spawn(composition: tuple[int, int, int]) -> UnitType | None:
+            """按严格优先级补齐阶梯编制：只产第一个有缺口的兵种，买不起就返回 None。
+
+            2026-08-24 用户实测 19工7先5游（目标 18:6:6）——工人和先锋都超产了，
+            游侠缺口却还在。原因是此前没有统一入口：develop 分支的三个
+            `if X < 目标 and 预算够` 是独立判断，便宜的兵种会在贵的买不起时插队；
+            召回分支更是完全绕过绝对目标，直接用 continuous_growth_spawn 的比压
+            容差，于是把资源花在已达标的兵种上。现在两条路径共用本函数。
+
+            顺序默认 先锋 → 游侠 → 工人（沿用原策略）；勾选"全局最优生产顺序"后
+            改为按基础价降序 游侠 → 先锋 → 工人，让贵的落在低倍率的早期位置。
+
+            返回 None 有两种含义，由调用方决定后续：阶梯生效时代表"缺的买不起就
+            等着"，阶梯关闭时代表"回退到连续增长"。
+            """
+
+            order = (
+                (UnitType.RANGER, rangers, composition[2], ranger_cost),
+                (UnitType.VANGUARD, vanguards, composition[1], vanguard_cost),
+                (UnitType.WORKER, workers, composition[0], worker_cost),
+            )
+            if not self.memory.optimal_spawn_order:
+                order = (order[1], order[0], order[2])
+            for unit_type, actual, want, cost in order:
+                if actual >= want:
+                    continue
+                if budget < cost:
+                    return None
+                if (
+                    unit_type is UnitType.WORKER
+                    and projected_resources - cost < DEFENSE_REPLACEMENT_RESERVE
+                ):
+                    return None
+                return unit_type
             return None
 
         if recovery_active:
@@ -11205,6 +11260,13 @@ class SmartTactic:
             # 收兵回防，不该让阶梯与囤积失效。
             if hoard_block:
                 return None
+            recall_composition = _effective_composition(
+                self.memory, workers, vanguards, rangers, projected_resources
+            )
+            if recall_composition is not None:
+                # 阶梯生效时走严格优先级，不用比压容差——否则已达标的兵种会被
+                # 继续生产（实测召回中出现 19工7先5游，游侠缺口还在）。
+                return ladder_spawn(recall_composition)
             return continuous_growth_spawn(develop_growth_profile)
 
         if mode == MODE_DEVELOP:
@@ -11242,42 +11304,22 @@ class SmartTactic:
             composition = _effective_composition(
                 self.memory, workers, vanguards, rangers, projected_resources
             )
-            vanguard_target = (
-                composition[1]
-                if composition is not None
-                else RAID_HOME_RESERVE_VANGUARDS
-                + DEVELOP_BEACON_EXPEDITION_VANGUARDS
+            if composition is not None:
+                # 阶梯生效期间严格按缺口补：缺的兵种买不起就等着，绝不产已达标兵
+                # 种的多余单位。continuous_growth_spawn 的 0.20 比压容差本意是"最缺
+                # 的暂时买不起就先产下一种"，在囤积期间反而有害：18工5先6游、资源
+                # 107 时先锋差 1 却买不起（需 95+13=108），容差会放行第 19 个工人，
+                # 把刚攒起来的资源花掉、还多出一个超产单位。
+                return ladder_spawn(composition)
+            # 阶梯关闭或已用尽：先按项目原编制补齐，缺口买不起则继续连续增长。
+            fallback_composition = (
+                DEVELOP_TARGET_WORKERS,
+                RAID_HOME_RESERVE_VANGUARDS + DEVELOP_BEACON_EXPEDITION_VANGUARDS,
+                RAID_HOME_RESERVE_RANGERS + DEVELOP_BEACON_EXPEDITION_RANGERS,
             )
-            ranger_target = (
-                composition[2]
-                if composition is not None
-                else RAID_HOME_RESERVE_RANGERS + DEVELOP_BEACON_EXPEDITION_RANGERS
-            )
-            worker_target = (
-                composition[0] if composition is not None else DEVELOP_TARGET_WORKERS
-            )
-            if vanguards < vanguard_target and budget >= vanguard_cost:
-                return UnitType.VANGUARD
-            if rangers < ranger_target and budget >= ranger_cost:
-                return UnitType.RANGER
-            if (
-                workers < worker_target
-                and budget >= worker_cost
-                and projected_resources - worker_cost
-                >= DEFENSE_REPLACEMENT_RESERVE
-            ):
-                return UnitType.WORKER
-            # 2026-08-24 阶梯还有缺口但缺的兵种买不起时就等着，不产已达标兵种的
-            # 多余单位。continuous_growth_spawn 的 0.20 比压容差本意是"最缺的兵种
-            # 暂时买不起就先产下一种"，在囤积期间反而有害：18工5先6游、资源 107
-            # 时先锋差 1 却买不起（需 95+13=108），容差会放行第 19 个工人，把刚
-            # 攒起来的资源花掉、还多出一个超产单位。
-            if composition is not None and (
-                vanguards < vanguard_target
-                or rangers < ranger_target
-                or workers < worker_target
-            ):
-                return None
+            fallback_pick = ladder_spawn(fallback_composition)
+            if fallback_pick is not None:
+                return fallback_pick
             return continuous_growth_spawn(develop_growth_profile)
 
         if mode == MODE_AGGRESS:

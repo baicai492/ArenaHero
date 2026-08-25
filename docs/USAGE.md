@@ -185,6 +185,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | 定位 | 按单位或事件坐标聚焦地图 |
 | 日志 | 显示脱敏中文事件流 |
 | 设置 | 调整目标距离、偷袭编组数量和侵略编组数量 |
+| 全局最优生产 | 补编制缺口时按兵种基础价降序生产，降低同一串产兵的总耗 |
 
 快捷键：
 
@@ -220,6 +221,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | `ally_support_enabled` | boolean | 盟友 Core 被攻击时派兵支援 |
 | `hoard_stage1` | boolean | 发育模式人口达 20 后先把资源攒到 95 再产兵 |
 | `hoard_stage2` | boolean | 发育模式人口达 30 后先把资源攒到 150 再产兵 |
+| `optimal_spawn_order` | boolean | 补编制缺口时改用全局资源最优顺序（游侠→先锋→工人）；关闭时用项目原顺序（先锋→游侠→工人） |
 | `target_population` | non-negative integer | 发育编制阶梯第一级的目标人口，默认 20；0 关闭阶梯 |
 | `composition_workers` | non-negative integer | 阶梯第一级的工人配比，默认 12 |
 | `composition_vanguards` | non-negative integer | 阶梯第一级的先锋配比，默认 4 |
