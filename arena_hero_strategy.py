@@ -506,12 +506,36 @@ WORKER_YIELD_PATH_SCAN_LENGTH = 8
 # 工人、Core 在 38 格外时单次可展开近两万节点，每 Tick 两趟直接把 turn 算超时，
 # 服务器全部回 TICK_MISMATCH。真实通路在开阔地形下几百次展开就能找到，封顶后
 # 最坏情况也只是放弃这次让路，下个 Tick 再试。
-# 2026-08-26 同一上限也用在 return_cargo / develop_local_recall /
+#
+# 2026-08-26 同一上限曾经原样用在 return_cargo / develop_local_recall /
 # rendezvous_moving_core 这三处高频 toward() 调用：拥堵时这些调用同样会反复
 # 展开近默认上限（30000）的节点，多个工人叠加即可把单 Tick 算超时，实测连续
 # 8~9 个 Tick 的 TICK_MISMATCH（工人卡在 return_cargo:fallback 反复横跳）。
-PATHFINDING_MAX_EXPANSIONS = 2000
-WORKER_YIELD_PATH_MAX_EXPANSIONS = PATHFINDING_MAX_EXPANSIONS
+#
+# 2026-08-27 发现固定 2000 用在这三处是错的：它们是工人每 Tick 的主移动调用
+# （每个需要移动的工人每 Tick 恰好一次），不是纯探测。封顶太低时真正需要远距离
+# 寻路的工人会提前放弃、退化成单步贪心，在两格间来回走——这正是"原地打转"的
+# 直接成因之一。用真实存档复现两个远端工人（距 Core 78/103 格，`visited`
+# 热力值已接近上限）验证：`_find_path` 分别需要 9885/19767 次展开才能找到
+# 真实路径，远超 2000。固定低封顶只是把"计算超时"换成"找不到路"，对这些工人是
+# 纯粹的倒退。
+#
+# 改为随距离线性缩放：近距离维持接近原先的低封顶（压住拥堵造成的搜索膨胀），
+# 远距离给够预算。系数按上面两个真实样本反推（250/格覆盖两者的实测需求，留有
+# 余量），封顶对齐 `_find_path` 默认上限，不会比不设封顶更贵。
+WORKER_YIELD_PATH_MAX_EXPANSIONS = 2000
+PATHFINDING_MIN_EXPANSIONS = 2000
+PATHFINDING_EXPANSIONS_PER_CELL = 250
+PATHFINDING_MAX_EXPANSIONS_CAP = 30000
+
+
+def _pathfinding_budget(distance: int) -> int:
+    """按起点到目标的距离缩放高频 toward() 调用的寻路展开上限，见上方注释。"""
+
+    return min(
+        PATHFINDING_MAX_EXPANSIONS_CAP,
+        max(PATHFINDING_MIN_EXPANSIONS, distance * PATHFINDING_EXPANSIONS_PER_CELL),
+    )
 # 每 Tick 最多对几名工人做探测寻路（区别于上面的"最多救几名"：走不通的工人也要
 # 计入，否则一屋子被困工人仍会把 A* 调用量堆上去）。
 WORKER_YIELD_MAX_PROBES_PER_TICK = 6
@@ -4903,7 +4927,7 @@ class SmartTactic:
                             worker,
                             return_position,
                             "rendezvous_moving_core",
-                            max_expansions=PATHFINDING_MAX_EXPANSIONS,
+                            max_expansions=_pathfinding_budget(_distance(worker.position, return_position)),
                         )
                     continue
                 if (
@@ -4927,7 +4951,7 @@ class SmartTactic:
                         worker,
                         return_position,
                         "return_cargo",
-                        max_expansions=PATHFINDING_MAX_EXPANSIONS,
+                        max_expansions=_pathfinding_budget(_distance(worker.position, return_position)),
                     )
                 continue
 
@@ -5117,7 +5141,7 @@ class SmartTactic:
                     turn.core.position,
                     "develop_local_recall",
                     avoid=recent_avoid,
-                    max_expansions=PATHFINDING_MAX_EXPANSIONS,
+                    max_expansions=_pathfinding_budget(_distance(worker.position, turn.core.position)),
                 )
                 if not moved and recent_avoid:
                     # 狭窄通道里唯一可行步可能正是上一格；避让失败时允许
@@ -5126,7 +5150,7 @@ class SmartTactic:
                         worker,
                         turn.core.position,
                         "develop_local_recall:backtrack",
-                        max_expansions=PATHFINDING_MAX_EXPANSIONS,
+                        max_expansions=_pathfinding_budget(_distance(worker.position, turn.core.position)),
                     )
                 if moved:
                     unassigned.pop(worker_id, None)
