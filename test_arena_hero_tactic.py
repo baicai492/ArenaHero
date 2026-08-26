@@ -1541,6 +1541,41 @@ class BalancedTacticTests(unittest.TestCase):
             any("beacon_head_start" in decision for decision in summary.decisions)
         )
 
+    def test_disable_beacon_scout_keeps_pair_home(self) -> None:
+        memory = TacticMemory()
+        memory.disable_beacon_scout = True
+        turn, _ = make_turn(
+            own_core=core((0, 0)),
+            units=(
+                vanguard((1, 0), VANGUARD_ID),
+                vanguard((-1, 0), VANGUARD_TWO_ID),
+                vanguard((2, 0), VANGUARD_THREE_ID),
+                ranger((0, -2), RANGER_ID),
+                ranger((2, 1), RANGER_TWO_ID),
+            ),
+            beacon=ChampionBeacon(position=(80, 0)),
+            resources=0,
+        )
+
+        summary = SmartTactic(memory).choose_actions(turn)
+
+        self.assertEqual(memory.mode, MODE_DEVELOP)
+        self.assertFalse(
+            any("beacon_head_start" in decision for decision in summary.decisions)
+        )
+
+    def test_disable_beacon_scout_reads_from_control(self) -> None:
+        memory = TacticMemory()
+        self.assertFalse(memory.disable_beacon_scout)
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "disable_beacon_scout": True}),
+                encoding="utf-8",
+            )
+            memory.load_control(control_path)
+        self.assertTrue(memory.disable_beacon_scout)
+
     def test_beacon_mode_retires_worker_beacon_goal_for_local_economy(self) -> None:
         memory = TacticMemory(
             mode=MODE_BEACON,

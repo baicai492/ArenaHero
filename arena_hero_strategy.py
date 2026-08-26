@@ -302,6 +302,12 @@ DEFAULT_GROWTH_RANGERS = 6
 # 总花费 = Σ 基础价 × 该位置的倍率；倍率随人口单调递增，把贵的排在前面（低倍率
 # 位置）、便宜的垫后总花费最低。关闭时沿用项目原顺序 先锋 → 游侠 → 工人。
 DEFAULT_OPTIMAL_SPAWN_ORDER = False
+# 2026-08-26 禁止头程侦察（control 配置）：develop 模式下不再主动派 1 先锋 +
+# 1 游侠去信标方向打头阵。配合解除召回使用：召回会把战斗单位逼进两圈固定坐标
+# （先锋贴身 1 格、游侠环绕 2 格那几个精确坐标），这正是密集扎堆、互相挤占
+# 同一格的根源；解除召回后摆位改用按威胁反应的松散防守，但会重新触发头程
+# 侦察——这个开关单独把侦察关掉，摆位交给普通防守逻辑。
+DEFAULT_DISABLE_BEACON_SCOUT = False
 # Once the Beacon home screen has five Vanguards, preserve the next affordable
 # resource window for the cheaper pre-population-20 Ranger instead of filling
 # a sixth/eighth Vanguard first.
@@ -1016,6 +1022,8 @@ class TacticMemory:
     hoard_on_capacity: bool = DEFAULT_HOARD_ON_CAPACITY
     # 2026-08-25 人口过 30 后的通用囤积水位（control 配置），所有模式生效。
     hoard_target_after_30: int = DEFAULT_HOARD_TARGET_AFTER_30
+    # 2026-08-26 禁止头程侦察（control 配置）：develop 下不再派兵去信标打头阵。
+    disable_beacon_scout: bool = DEFAULT_DISABLE_BEACON_SCOUT
     # 2026-08-24 浏览器水晶提示的搜索半径（control 配置），0 表示不使用提示。
     browser_hint_distance: int = DEFAULT_BROWSER_HINT_DISTANCE
     # 2026-08-24 每 Tick 最多派几名工人验证浏览器提示（control 配置）。
@@ -2286,6 +2294,9 @@ class TacticMemory:
             self.hoard_on_capacity = bool(
                 data.get("hoard_on_capacity", self.hoard_on_capacity)
             )
+            self.disable_beacon_scout = bool(
+                data.get("disable_beacon_scout", self.disable_beacon_scout)
+            )
             for key in (
                 "target_population",
                 "composition_workers",
@@ -2586,6 +2597,7 @@ class TacticMemory:
                     + unit_cost(UnitType.RANGER, len(turn.units))
                 ),
                 "hoard_on_capacity": self.hoard_on_capacity,
+                "disable_beacon_scout": self.disable_beacon_scout,
                 "hoard_target_after_30": self.hoard_target_after_30,
                 "target_population": self.target_population,
                 "composition_workers": self.composition_workers,
@@ -7052,6 +7064,7 @@ class SmartTactic:
         if (
             self.memory.mode != MODE_DEVELOP
             or self.memory.recall
+            or self.memory.disable_beacon_scout
             or _owns_beacon(turn)
             or turn.core is None
             or _distance(turn.core.position, turn.beacon.position)

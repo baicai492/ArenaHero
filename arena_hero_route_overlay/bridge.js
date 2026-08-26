@@ -102,6 +102,7 @@
       "optimal_spawn_order",
       "yield_path_to_workers",
       "hoard_on_capacity",
+      "disable_beacon_scout",
     ]) {
       if (typeof payload[key] === "boolean") {
         update[key] = payload[key];

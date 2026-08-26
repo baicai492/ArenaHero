@@ -39,6 +39,7 @@ CONTROL_FLAG_DEFAULTS = {
     "optimal_spawn_order": False,
     "yield_path_to_workers": False,
     "hoard_on_capacity": False,
+    "disable_beacon_scout": False,
 }
 EMPTY_ROUTES = {
     "version": 2,
@@ -79,6 +80,7 @@ EMPTY_STATS = {
     "yield_path_to_workers": False,
     "hoard_on_capacity": False,
     "hoard_target_after_30": 0,
+    "disable_beacon_scout": False,
     "effective_growth_workers": 5,
     "effective_growth_vanguards": 4,
     "effective_growth_rangers": 6,

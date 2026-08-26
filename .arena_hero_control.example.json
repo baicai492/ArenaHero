@@ -17,6 +17,7 @@
   "optimal_spawn_order": false,
   "yield_path_to_workers": false,
   "hoard_on_capacity": false,
+  "disable_beacon_scout": false,
   "target_population": 20,
   "composition_workers": 12,
   "composition_vanguards": 4,

@@ -37,6 +37,7 @@
     optimal_spawn_order: false,
     yield_path_to_workers: false,
     hoard_on_capacity: false,
+    disable_beacon_scout: false,
   };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
@@ -475,6 +476,20 @@
       parts.push(`累计载货打转 ${stuck} 次`);
     }
     return parts.length ? `\n当前生效：${parts.join(" · ")}` : "\n当前生效：已开启";
+  }
+
+  // 禁止头程侦察的实时状态。
+  function disableBeaconScoutStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.disable_beacon_scout !== "boolean") {
+      return "";
+    }
+    if (stats.mode !== "develop") {
+      return `\n当前生效：${MODE_LABELS[stats.mode] || stats.mode}模式本就没有头程侦察，此开关不影响`;
+    }
+    return stats.disable_beacon_scout
+      ? "\n当前生效：已禁止，不会主动派兵去信标方向打头阵"
+      : "\n当前生效：未禁止，条件满足时仍会派 1 先锋 + 1 游侠打头阵";
   }
 
   // 全局最优生产顺序的实时状态：说明当前按哪个顺序补缺口。
@@ -1051,6 +1066,20 @@
         "\n已经超产时暂时允许总数到 目标+超产量：只补还没达标的兵种，达标或超出的不再增加。" +
         "\n与囤积叠加时的放行线是 水位 + 该顺序下一个要产单位的成本。" +
         optimalOrderStatusText(),
+    );
+    addControlCheckbox(
+      panel,
+      "disable_beacon_scout",
+      "禁止头程侦察",
+      () =>
+        "【develop 发育模式】不再主动派 1 先锋 + 1 游侠去信标方向打头阵。" +
+        "\n原策略在先锋≥2、游侠≥2、信标够远、附近安全时会挑一先锋一游侠先出发探路；" +
+        "勾选后这个派遣直接跳过，两名单位留在家和其它守军一起走普通防守逻辑。" +
+        "\n配合解除召回使用：召回会把战斗单位逼进两圈固定坐标（先锋贴身 1 格、游侠环绕 2 格），" +
+        "这正是密集扎堆、互相挤占同一格的根源；解除召回后摆位改用按威胁反应的松散防守，" +
+        "但会重新触发头程侦察——勾上这个开关就能只留下松散防守、不派兵外出。" +
+        "\n只影响 develop 的头程侦察，不影响其它模式，也不影响独立偷袭（raid_enabled）。" +
+        disableBeaconScoutStatusText(),
     );
     addControlCheckbox(
       panel,

@@ -189,6 +189,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | 优先给工人让路 | 挡住工人去路的自己人主动闪避一步，解开走廊拥堵 |
 | 容量够就先攒满 | 囤积改看仓库容量而不是人口门槛 |
 | 30 之后的攒资源目标 | 人口过 30 后的通用水位，所有模式生效 |
+| 禁止头程侦察 | develop 模式下不再主动派 1 先锋 + 1 游侠去信标方向打头阵 |
 
 快捷键：
 
@@ -228,6 +229,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | `yield_path_to_workers` | boolean | 工人地形上有路、却被自己人占满而寻不到路时，挡路单位主动闪避一步 |
 | `hoard_on_capacity` | boolean | 囤积档位改用容量判定：仓库装得下水位就开始攒，不等人口门槛，也不受超产顺移影响 |
 | `hoard_target_after_30` | non-negative integer | 人口过 30 后的通用囤积水位，**所有模式生效**。0 = develop 下回落两档开关、其它模式无目标；非 0 直接覆盖两档。高于仓库容量时自动夹到容量上限 |
+| `disable_beacon_scout` | boolean | develop 模式下禁止头程侦察：不再主动派 1 先锋 + 1 游侠去信标方向打头阵，两名单位留在家走普通防守逻辑 |
 | `target_population` | non-negative integer | 发育编制阶梯第一级的目标人口，默认 20；0 关闭阶梯 |
 | `composition_workers` | non-negative integer | 阶梯第一级的工人配比，默认 12 |
 | `composition_vanguards` | non-negative integer | 阶梯第一级的先锋配比，默认 4 |
