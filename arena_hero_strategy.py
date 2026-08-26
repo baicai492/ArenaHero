@@ -521,11 +521,13 @@ WORKER_YIELD_PATH_SCAN_LENGTH = 8
 # 纯粹的倒退。
 #
 # 改为随距离线性缩放：近距离维持接近原先的低封顶（压住拥堵造成的搜索膨胀），
-# 远距离给够预算。系数按上面两个真实样本反推（250/格覆盖两者的实测需求，留有
-# 余量），封顶对齐 `_find_path` 默认上限，不会比不设封顶更贵。
+# 远距离给够预算。系数按四个真实样本（78/103 格外的两个 worker，以及新发现的
+# 72/73 格外另一对，见下方 2026-08-27 补充记录）反推：250/格覆盖不了全部四个
+# 样本，实测需要 400/格才能让最贵的一个（72 格、约 254 展开/格）也找到路；
+# 封顶对齐 `_find_path` 默认上限，不会比不设封顶更贵。
 WORKER_YIELD_PATH_MAX_EXPANSIONS = 2000
 PATHFINDING_MIN_EXPANSIONS = 2000
-PATHFINDING_EXPANSIONS_PER_CELL = 250
+PATHFINDING_EXPANSIONS_PER_CELL = 400
 PATHFINDING_MAX_EXPANSIONS_CAP = 30000
 
 
