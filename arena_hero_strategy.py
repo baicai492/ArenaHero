@@ -506,7 +506,12 @@ WORKER_YIELD_PATH_SCAN_LENGTH = 8
 # 工人、Core 在 38 格外时单次可展开近两万节点，每 Tick 两趟直接把 turn 算超时，
 # 服务器全部回 TICK_MISMATCH。真实通路在开阔地形下几百次展开就能找到，封顶后
 # 最坏情况也只是放弃这次让路，下个 Tick 再试。
-WORKER_YIELD_PATH_MAX_EXPANSIONS = 2000
+# 2026-08-26 同一上限也用在 return_cargo / develop_local_recall /
+# rendezvous_moving_core 这三处高频 toward() 调用：拥堵时这些调用同样会反复
+# 展开近默认上限（30000）的节点，多个工人叠加即可把单 Tick 算超时，实测连续
+# 8~9 个 Tick 的 TICK_MISMATCH（工人卡在 return_cargo:fallback 反复横跳）。
+PATHFINDING_MAX_EXPANSIONS = 2000
+WORKER_YIELD_PATH_MAX_EXPANSIONS = PATHFINDING_MAX_EXPANSIONS
 # 每 Tick 最多对几名工人做探测寻路（区别于上面的"最多救几名"：走不通的工人也要
 # 计入，否则一屋子被困工人仍会把 A* 调用量堆上去）。
 WORKER_YIELD_MAX_PROBES_PER_TICK = 6
@@ -3357,6 +3362,7 @@ class MovementPlanner:
         reason: str,
         *,
         avoid: Iterable[Position] = (),
+        max_expansions: int = 30000,
     ) -> bool:
         if unit.position == goal:
             return False
@@ -3367,6 +3373,7 @@ class MovementPlanner:
             blocked=self._blocked(unit, goal, avoid_cells),
             threat=self.threat,
             visited=self.memory.visited,
+            max_expansions=max_expansions,
         )
         route = _route_positions(unit.position, path)
         if path and self._queue(
@@ -4896,6 +4903,7 @@ class SmartTactic:
                             worker,
                             return_position,
                             "rendezvous_moving_core",
+                            max_expansions=PATHFINDING_MAX_EXPANSIONS,
                         )
                     continue
                 if (
@@ -4915,7 +4923,12 @@ class SmartTactic:
                     self.memory.decision_totals["worker:cargo_queue_hold"] += 1
                     continue
                 if worker.position != return_position:
-                    planner.toward(worker, return_position, "return_cargo")
+                    planner.toward(
+                        worker,
+                        return_position,
+                        "return_cargo",
+                        max_expansions=PATHFINDING_MAX_EXPANSIONS,
+                    )
                 continue
 
             worker_id = str(worker.id)
@@ -5104,6 +5117,7 @@ class SmartTactic:
                     turn.core.position,
                     "develop_local_recall",
                     avoid=recent_avoid,
+                    max_expansions=PATHFINDING_MAX_EXPANSIONS,
                 )
                 if not moved and recent_avoid:
                     # 狭窄通道里唯一可行步可能正是上一格；避让失败时允许
@@ -5112,6 +5126,7 @@ class SmartTactic:
                         worker,
                         turn.core.position,
                         "develop_local_recall:backtrack",
+                        max_expansions=PATHFINDING_MAX_EXPANSIONS,
                     )
                 if moved:
                     unassigned.pop(worker_id, None)
