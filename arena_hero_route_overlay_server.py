@@ -38,9 +38,12 @@ CONTROL_FLAG_DEFAULTS = {
     "hoard_stage2": False,
     "optimal_spawn_order": False,
     "yield_path_to_workers": False,
+    "traffic_control": False,
     "hoard_on_capacity": False,
     "disable_beacon_scout": False,
 }
+
+
 EMPTY_ROUTES = {
     "version": 2,
     "tick": 0,
@@ -78,6 +81,7 @@ EMPTY_STATS = {
     "growth_rangers": 6,
     "optimal_spawn_order": False,
     "yield_path_to_workers": False,
+    "traffic_control": False,
     "hoard_on_capacity": False,
     "hoard_target_after_30": 0,
     "disable_beacon_scout": False,
@@ -139,6 +143,9 @@ EMPTY_STATS = {
     "move_failures": 0,
     "yield_path_to_worker_total": 0,
     "cargo_stuck_total": 0,
+    "traffic_control_total": 0,
+    "traffic_yield_total": 0,
+    "traffic_yield_chain_total": 0,
     "cargo_queue_hold_total": 0,
     "manual_overrides": 0,
     "event_totals": {},

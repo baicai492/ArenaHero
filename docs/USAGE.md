@@ -187,6 +187,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | 设置 | 调整目标距离、偷袭编组数量和侵略编组数量 |
 | 全局最优生产 | 补编制缺口时按兵种基础价降序生产，降低同一串产兵的总耗 |
 | 优先给工人让路 | 挡住工人去路的自己人主动闪避一步，解开走廊拥堵 |
+| 通行调度 | 沿工人整条通路清障 + 递归推挤，处理单步让路解决不了的深度拥堵 |
 | 容量够就先攒满 | 囤积改看仓库容量而不是人口门槛 |
 | 30 之后的攒资源目标 | 人口过 30 后的通用水位，所有模式生效 |
 | 禁止头程侦察 | develop 模式下不再主动派 1 先锋 + 1 游侠去信标方向打头阵 |
@@ -227,6 +228,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | `hoard_stage2` | boolean | 发育模式人口达 30 后先把资源攒到 150 再产兵 |
 | `optimal_spawn_order` | boolean | 补编制缺口时改用全局资源最优顺序（游侠→先锋→工人）；关闭时用项目原顺序（先锋→游侠→工人） |
 | `yield_path_to_workers` | boolean | 工人地形上有路、却被自己人占满而寻不到路时，挡路单位主动闪避一步 |
+| `traffic_control` | boolean | 通行调度：沿工人整条通路清障（往前 12 格）+ 递归推挤（最多 2 层），处理单步让路解决不了的深度拥堵。可与 `yield_path_to_workers` 同时开启 |
 | `hoard_on_capacity` | boolean | 囤积档位改用容量判定：仓库装得下水位就开始攒，不等人口门槛，也不受超产顺移影响 |
 | `hoard_target_after_30` | non-negative integer | 人口过 30 后的通用囤积水位，**所有模式生效**。0 = develop 下回落两档开关、其它模式无目标；非 0 直接覆盖两档。高于仓库容量时自动夹到容量上限 |
 | `disable_beacon_scout` | boolean | develop 模式下禁止头程侦察：不再主动派 1 先锋 + 1 游侠去信标方向打头阵，两名单位留在家走普通防守逻辑 |
@@ -306,9 +308,16 @@ Invoke-RestMethod http://127.0.0.1:8765/stats
 
 ### 工人来回走、货卸不掉
 
-人口一多（尤其召回把战斗单位堆在 Core 附近），走廊会被自己人占满：每格最多 2 个实体，工人地形上有路却寻不到路，只能在两格之间来回走。打开控制字段 `yield_path_to_workers`（面板「优先给工人让路」）让挡路单位闪避一步。
+先分清两类原因，处理方式完全不同。看决策日志里该工人的 `reason`：
 
-判断是否生效：看统计里的 `yield_path_to_worker_total` 与 `cargo_stuck_total`。让路次数上升、打转次数停止增长即为对症；打转仍在涨说明堵点在地形、临时封锁或 Core 门口，见上一节。
+**带 `:fallback`（例如 `return_cargo:fallback`）= 完整寻路失败，退化成单步贪心。** 这类打转已在策略里修掉三个成因，无需开关，升级策略即可：加权 A\*（`PATHFINDING_HEURISTIC_WEIGHT`）解决启发式与 `visited` 代价尺度不匹配导致的搜索爆炸（实测最坏展开量 33133 超过 30000 硬上限，注定寻不到路）；贪心分支加了反打转，不再走回上一个 Tick 待过的格；`_blocked()` 补上本 Tick 已计划移入的格。细节见 [STRATEGY.md 2.1.3](STRATEGY.md#213-寻路退化与打转)。如果升级后仍然看到大量 `:fallback`，那是真的没路（地形死路或临时封锁），不是寻路缺陷。
+
+**不带 `:fallback` 但位置长期不下降 = 寻到路了，被自己人占满的走廊卡住。** 每格最多 2 个实体，人口一多（尤其召回把战斗单位堆在 Core 附近）走廊会被占满。两个开关按拥堵深度递进：
+
+- `yield_path_to_workers`（面板「优先给工人让路」）：让通路上第一个满格的挡路单位闪避一步。适合浅拥堵。
+- `traffic_control`（面板「通行调度」）：沿整条通路往前 12 格逐个清障，挡路单位四周也满时递归把外层单位推开腾出落脚点（最多 2 层）。防守单位一多，相邻格普遍都是满的，单步让路会当场失败——这时才需要它。
+
+判断是否生效：`yield_path_to_worker_total`、`traffic_control_total`、`traffic_yield_chain_total` 与 `cargo_stuck_total` 一起看。让路/疏通次数上升、打转次数停止增长即为对症。`traffic_yield_chain_total` 占比高说明拥堵已经深到单步让路根本处理不了。
 
 ### API Key 无法解密
 

@@ -65,13 +65,17 @@
   }
 
   function loadSettings() {
-    chrome.storage.local.get([SETTINGS_KEY], (result) => {
-      if (chrome.runtime.lastError) {
-        publish("settings", {});
-        return;
-      }
-      publish("settings", result[SETTINGS_KEY] || {});
-    });
+    try {
+      chrome.storage.local.get([SETTINGS_KEY], (result) => {
+        if (chrome.runtime.lastError) {
+          publish("settings", {});
+          return;
+        }
+        publish("settings", result[SETTINGS_KEY] || {});
+      });
+    } catch (error) {
+      publish("settings", {});
+    }
   }
 
   function handleControlUpdate(message) {
@@ -101,6 +105,7 @@
       "hoard_stage2",
       "optimal_spawn_order",
       "yield_path_to_workers",
+      "traffic_control",
       "hoard_on_capacity",
       "disable_beacon_scout",
     ]) {
@@ -243,17 +248,27 @@
         },
       }, () => {});
     } else if (message.kind === "settings:update") {
-      chrome.storage.local.set({ [SETTINGS_KEY]: message.payload });
+      try {
+        chrome.storage.local.set({ [SETTINGS_KEY]: message.payload });
+      } catch (error) {
+        // 扩展上下文失效（例如刚被重新加载/更新）时 chrome.storage 会变成
+        // undefined，写入必然抛错；此时页面里残留的旧 content script 实例
+        // 本来就该被丢弃，静默失败即可，不必让整页抛出未捕获异常。
+      }
     } else if (message.kind === "control:update") {
       handleControlUpdate(message);
     }
   });
 
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName === "local" && changes[SETTINGS_KEY]) {
-      publish("settings", changes[SETTINGS_KEY].newValue || {});
-    }
-  });
+  try {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName === "local" && changes[SETTINGS_KEY]) {
+        publish("settings", changes[SETTINGS_KEY].newValue || {});
+      }
+    });
+  } catch (error) {
+    // 同上：上下文失效时不应再监听。
+  }
 
   loadSettings();
   poll();

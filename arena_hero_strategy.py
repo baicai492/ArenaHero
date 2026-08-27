@@ -521,10 +521,26 @@ WORKER_YIELD_PATH_SCAN_LENGTH = 8
 # 纯粹的倒退。
 #
 # 改为随距离线性缩放：近距离维持接近原先的低封顶（压住拥堵造成的搜索膨胀），
-# 远距离给够预算。系数按四个真实样本（78/103 格外的两个 worker，以及新发现的
-# 72/73 格外另一对，见下方 2026-08-27 补充记录）反推：250/格覆盖不了全部四个
-# 样本，实测需要 400/格才能让最贵的一个（72 格、约 254 展开/格）也找到路；
-# 封顶对齐 `_find_path` 默认上限，不会比不设封顶更贵。
+# 远距离给够预算。
+#
+# 2026-08-27（二次修正）调系数只是在脆弱边界上挪位置，治标不治本。真正的缺陷在
+# 启发式与代价尺度不匹配：`_find_path` 的单步代价含 `min(3.0, visited*0.08)`，
+# 被反复走过的格子单步代价从 1.0 膨胀到 4.0，而启发式仍是未加权的曼哈顿距离。
+# 代价放大、启发式没跟着放大 → A* 退化成近似 Dijkstra，展开量随距离爆炸。实测
+# 同一个 72 格外的工人：带 visited 惩罚要 18288 次展开，去掉惩罚只要 528 次，
+# 相差 35 倍。于是「封顶 → 找不到路 → 退化成单步贪心 → 在两格间来回走 → 这两格
+# visited 再 +1 → 更贵」形成正反馈，工人永久打转，且与让路开关无关（实测关掉
+# `yield_path_to_workers` 后照样打转）。
+#
+# 通解是加权 A*：把启发式乘以一个权重，让它重新压过被 `visited` 抬高的代价。
+# 加权 A* 仍然完备（有路一定找得到），只是不再保证「代价最优」——而这里的代价
+# 大部分是「别老走同一条路」的软偏好，不是真实通行成本，牺牲它完全划算。实测
+# 六个真实卡死样本，权重从 1.0 提到 5.0 后最坏展开量 20615 → 216（95 倍），
+# 且路径的实际步数不升反降（53 格那个从绕成 61 步变回最优的 53 步）：高权重让
+# 回仓工人直接走直线回家，不再为了躲开走熟的走廊而绕远，这正是物流想要的行为。
+# 展开量回到几百级别后 `_pathfinding_budget` 不再是瓶颈，打转的正反馈被切断，
+# TICK_MISMATCH 的风险也一并消失。
+PATHFINDING_HEURISTIC_WEIGHT = 5.0
 WORKER_YIELD_PATH_MAX_EXPANSIONS = 2000
 PATHFINDING_MIN_EXPANSIONS = 2000
 PATHFINDING_EXPANSIONS_PER_CELL = 400
@@ -544,6 +560,26 @@ WORKER_YIELD_MAX_PROBES_PER_TICK = 6
 # Core 这么近有敌人时不为物流打散阵型，生存优先（与 vacate 同一条边界）。
 WORKER_YIELD_CORE_THREAT_RADIUS = 5
 DEFAULT_YIELD_PATH_TO_WORKERS = False
+# 2026-08-27 通行调度（control `traffic_control`，面板「通行调度」）。
+# `yield_path_to_workers` 是单步贪心：只找工人通路上**第一个**满格，只让**一个**
+# 单位往**相邻空格**挪**一步**。防守单位一多，相邻格也是满的，让路当场失败；就算
+# 成功，通路上后面几个满格仍然堵着，工人这一 Tick 照样寻不到路。实测关掉让路和
+# 打开让路都会打转，说明这套贪心在人口上去之后基本失效。
+#
+# 通行调度把它换成「沿整条通路清障 + 递归推挤」：
+#   1. 沿工人通路往前扫更长一段，把途中**每一个**满格都尝试腾开，而不是只处理第一个；
+#   2. 挡路单位四周也满时，先递归把外层单位推开腾出落脚点，再让它挪进去（多步规划）；
+#   3. 每腾开一格就重新验证工人是否已经能寻到路，能走就停手，不做多余的阵型扰动。
+# 单位越多、拥堵越深，第 2 步的收益越大——这正是原来那套单步让路失效的场景。
+DEFAULT_TRAFFIC_CONTROL = False
+# 沿工人通路往前清障的长度。比单步让路的 8 长，因为要一次清完整段拥堵。
+TRAFFIC_CONTROL_SCAN_LENGTH = 12
+# 递归推挤的层数。1 = 只推一层（挡路单位的邻居），2 = 邻居的邻居也能被推开。
+# 再深收益递减，且会把阵型搅得太散。
+TRAFFIC_CONTROL_PUSH_DEPTH = 2
+# 每 Tick 最多疏通几名工人 / 最多做几次探测寻路（限制单 Tick 计算量）。
+TRAFFIC_CONTROL_MAX_RESCUES_PER_TICK = 6
+TRAFFIC_CONTROL_MAX_PROBES_PER_TICK = 10
 # 2026-08-25 囤积档位改用容量判定：仓库装得下水位就开始攒，不等人口门槛。
 DEFAULT_HOARD_ON_CAPACITY = False
 # 2026-08-25 人口过 30 后的通用囤积水位（所有模式生效）。0 = 回落两档开关；
@@ -1049,6 +1085,8 @@ class TacticMemory:
     optimal_spawn_order: bool = DEFAULT_OPTIMAL_SPAWN_ORDER
     # 2026-08-25 给工人让路（control 配置）：挡路的自己人主动挪开一步。
     yield_path_to_workers: bool = DEFAULT_YIELD_PATH_TO_WORKERS
+    # 2026-08-27 通行调度（control 配置）：沿整条通路清障 + 递归推挤。
+    traffic_control: bool = DEFAULT_TRAFFIC_CONTROL
     # 2026-08-25 囤积改用容量判定（control 配置）：仓库装得下水位就开始攒。
     hoard_on_capacity: bool = DEFAULT_HOARD_ON_CAPACITY
     # 2026-08-25 人口过 30 后的通用囤积水位（control 配置），所有模式生效。
@@ -2322,6 +2360,9 @@ class TacticMemory:
             self.yield_path_to_workers = bool(
                 data.get("yield_path_to_workers", self.yield_path_to_workers)
             )
+            self.traffic_control = bool(
+                data.get("traffic_control", self.traffic_control)
+            )
             self.hoard_on_capacity = bool(
                 data.get("hoard_on_capacity", self.hoard_on_capacity)
             )
@@ -2639,6 +2680,7 @@ class TacticMemory:
                 "growth_rangers": self.growth_rangers,
                 "optimal_spawn_order": self.optimal_spawn_order,
                 "yield_path_to_workers": self.yield_path_to_workers,
+                "traffic_control": self.traffic_control,
                 # 当前实际用于连续增长的权重（阶梯生效时是本级编制，用尽后是
                 # growth_*），面板 tooltip 直接显示。
                 "effective_growth_workers": stats_growth.get(UnitType.WORKER, 0),
@@ -2800,6 +2842,17 @@ class TacticMemory:
                 ),
                 "cargo_stuck_total": self.decision_totals.get(
                     "worker:cargo_stuck", 0
+                ),
+                # 通行调度诊断：疏通次数与递归推挤次数。递归推挤占比高说明拥堵
+                # 已经深到单步让路根本处理不了，这正是调度器存在的理由。
+                "traffic_control_total": self.decision_totals.get(
+                    "logistics:traffic_control", 0
+                ),
+                "traffic_yield_total": self.decision_totals.get(
+                    "logistics:traffic_yield", 0
+                ),
+                "traffic_yield_chain_total": self.decision_totals.get(
+                    "logistics:traffic_yield_chain", 0
                 ),
                 "cargo_queue_hold_total": self.decision_totals.get(
                     "worker:cargo_queue_hold", 0
@@ -3192,6 +3245,7 @@ def _find_path(
     threat: Counter[Position],
     visited: Counter[Position],
     max_expansions: int = 30000,
+    heuristic_weight: float = PATHFINDING_HEURISTIC_WEIGHT,
     ignore_occupancy_goals: bool = True,
 ) -> tuple[Direction, ...]:
     if start == goal:
@@ -3200,7 +3254,10 @@ def _find_path(
     search_radius = max(32, min(400, _distance(start, goal) + 60))
     frontier: list[tuple[float, float, int, Position]] = []
     sequence = 0
-    heapq.heappush(frontier, (float(_distance(start, goal)), 0.0, sequence, start))
+    heapq.heappush(
+        frontier,
+        (float(_distance(start, goal)) * heuristic_weight, 0.0, sequence, start),
+    )
     costs: dict[Position, float] = {start: 0.0}
     came_from: dict[Position, tuple[Position, Direction]] = {}
     expansions = 0
@@ -3232,7 +3289,7 @@ def _find_path(
             costs[nxt] = new_cost
             came_from[nxt] = (current, direction)
             sequence += 1
-            priority = new_cost + _distance(nxt, goal)
+            priority = new_cost + _distance(nxt, goal) * heuristic_weight
             heapq.heappush(frontier, (priority, new_cost, sequence, nxt))
     return ()
 
@@ -3280,7 +3337,12 @@ class MovementPlanner:
         )
         blocked.update(
             position
-            for position in self.occupancy
+            # 必须并上 arrivals：本 Tick 已有单位计划移入、但原本空着的格子不在
+            # `occupancy` 的键里，只查 `occupancy` 会漏判。漏判的后果不是绕路而是
+            # 直接打转——`_find_path` 把路径规划穿过那一格，`_queue()` 随后用
+            # `_can_enter()`（它算 arrivals）拒掉第一步，整条完整路径被丢弃，
+            # `toward()` 退化成单步贪心。
+            for position in set(self.occupancy) | set(self.arrivals)
             if position != unit.position and position != goal and self.final_occupancy(position) >= 2
         )
         return blocked
@@ -3381,6 +3443,18 @@ class MovementPlanner:
             max_expansions=max_expansions,
         )
 
+    def previous_position(self, unit: Unit) -> Position | None:
+        """单位上一个 Tick 所在的格；没有历史时返回 None。
+
+        `recent_positions` 每个 Tick 追加一次当前位置，末位就是本 Tick 的位置，
+        倒数第二位才是上一个 Tick 的位置。
+        """
+
+        recent = self.memory.recent_positions.get(str(unit.id))
+        if not recent or len(recent) < 2:
+            return None
+        return recent[-2]
+
     def toward(
         self,
         unit: Unit,
@@ -3413,10 +3487,20 @@ class MovementPlanner:
         ):
             return True
 
+        # 完整寻路失败，退化成单步贪心。这里必须显式反打转：贪心只看「哪一步离
+        # 目标最近」，当唯一能靠近目标的格子被地形/占用挡住时，四周所有候选都在
+        # 增加距离，贪心只能按固定的方向序挑一个——下个 Tick 从新格子看回来，原
+        # 来那一格又成了同样评分的最优解，于是在两格之间无限来回。实测工人可以
+        # 这样卡上千个 Tick，货一直卸不掉，而且每走一趟就给这两格的 `visited`
+        # 计数 +1，把寻路代价越推越高，形成正反馈。
+        # 把「回到上一个 Tick 待过的格」排到同等条件的最后：有别的路就绝不回头，
+        # 真的只剩回头路（1 格宽死胡同）时它仍然是候选，不会把单位钉死。
+        previous = self.previous_position(unit)
         candidates = sorted(
             DIRECTION_ORDER,
             key=lambda direction: (
                 self.threat.get(_destination(unit.position, direction), 0),
+                1 if _destination(unit.position, direction) == previous else 0,
                 _distance(_destination(unit.position, direction), goal),
                 self.memory.visited.get(_destination(unit.position, direction), 0),
                 self.memory.temporary_blocks.get(
@@ -3631,6 +3715,14 @@ class SmartTactic:
         # 让路必须在 _choose_workers 之前：挡路单位这一 Tick 就离开，占用数当场
         # 下降，工人随后才能真的寻到路，而不是等下个 Tick。
         self._yield_path_for_blocked_workers(
+            turn,
+            planner,
+            acted_units,
+            decisions,
+        )
+        # 通行调度同理，且排在单步让路之后：单步让路能解决的简单拥堵先解决掉，
+        # 剩下真正需要递归推挤的才交给调度器，避免两套机制在同一格上互相覆盖。
+        self._traffic_control_schedule(
             turn,
             planner,
             acted_units,
@@ -4508,6 +4600,194 @@ class SmartTactic:
                 self.memory.decision_totals["logistics:yield_path_to_worker"] += 1
                 return True
         return False
+
+    def _traffic_push_chain(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+        blocker_cell: Position,
+        path_cells: frozenset[Position],
+        depth: int,
+    ) -> bool:
+        """腾出 `blocker_cell` 的一个名额；相邻格也满时递归把外层单位先推开。
+
+        这是通行调度相对单步让路的核心区别。单步让路只问「挡路单位旁边有没有空
+        格」，人口一多答案基本都是「没有」，于是让路失败、工人继续打转。这里改成
+        先递归给挡路单位腾出一个落脚点，再让它挪过去——一次调度可以推动一串单位，
+        深度由 `TRAFFIC_CONTROL_PUSH_DEPTH` 限制，避免把整个阵型搅散。
+        """
+
+        candidates = [
+            unit
+            for unit in turn.units
+            if unit.position == blocker_cell
+            and unit.id not in acted_units
+            and not (isinstance(unit, Worker) and unit.cargo)
+        ]
+        # 战斗单位先让：空载工人挪开后往往又被自己的采集目标拉回原格。
+        candidates.sort(key=lambda unit: (isinstance(unit, Worker), unit.id.bytes))
+        for blocker in candidates:
+            # 先试最省事的：旁边本来就有空位。
+            target = self._yield_aside_target(turn, planner, blocker, path_cells)
+            if target is not None and planner.toward(
+                blocker,
+                target,
+                "traffic_yield",
+                avoid=tuple(path_cells),
+            ):
+                acted_units.add(blocker.id)
+                decisions.append(
+                    f"{blocker.view.unit_type.value.lower()}:{_short_id(blocker.id)} "
+                    f"traffic_yield cell={blocker_cell} aside={target}"
+                )
+                self.memory.decision_totals["logistics:traffic_yield"] += 1
+                return True
+            if depth <= 0:
+                continue
+            # 四周都满：递归腾出一个相邻格，再让挡路单位挪进去。
+            for direction in DIRECTION_ORDER:
+                neighbour = _destination(blocker.position, direction)
+                if (
+                    neighbour in path_cells
+                    or neighbour in planner.obstacles
+                    or neighbour in planner.enemy_cells
+                    or neighbour in turn.resource_cells
+                    or (turn.core is not None and neighbour == turn.core.position)
+                    or self.memory.temporary_blocks.get(neighbour, 0) > turn.tick
+                ):
+                    continue
+                if planner.final_occupancy(neighbour) < 2:
+                    continue  # 本来就有位，上面那一步已经试过了
+                if not self._traffic_push_chain(
+                    turn,
+                    planner,
+                    acted_units,
+                    decisions,
+                    neighbour,
+                    path_cells,
+                    depth - 1,
+                ):
+                    continue
+                if planner.toward(
+                    blocker,
+                    neighbour,
+                    "traffic_yield:chain",
+                    avoid=tuple(path_cells),
+                ):
+                    acted_units.add(blocker.id)
+                    decisions.append(
+                        f"{blocker.view.unit_type.value.lower()}:"
+                        f"{_short_id(blocker.id)} traffic_yield:chain "
+                        f"cell={blocker_cell} aside={neighbour} depth={depth}"
+                    )
+                    self.memory.decision_totals["logistics:traffic_yield_chain"] += 1
+                    return True
+        return False
+
+    def _traffic_control_schedule(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        """通行调度（control `traffic_control`）：沿整条通路清障 + 递归推挤。
+
+        与 `_yield_path_for_blocked_workers` 的区别见 `DEFAULT_TRAFFIC_CONTROL`
+        上方的注释。调度顺序按「载货优先、离目标近的优先」——近的先走能把走廊
+        从出口往里逐段腾空，远的跟着就通了；反过来先放远的会让它一头撞进还没
+        疏通的队尾。
+        """
+
+        if not self.memory.traffic_control:
+            return
+        core = turn.core
+        if core is None:
+            return
+        if any(
+            _distance(core.position, enemy.position) <= WORKER_YIELD_CORE_THREAT_RADIUS
+            for enemy in turn.visible_enemies
+        ):
+            return
+
+        movers: list[tuple[int, int, bytes, Worker, Position]] = []
+        for worker in turn.workers:
+            if worker.id in acted_units:
+                continue
+            if worker.cargo:
+                goal = self._worker_return_goal(turn, worker)
+            else:
+                existing_goal = self.memory.worker_goals.get(str(worker.id))
+                goal = existing_goal.position if existing_goal is not None else None
+            if goal is None or goal == worker.position:
+                continue
+            movers.append(
+                (
+                    0 if worker.cargo else 1,
+                    _distance(worker.position, goal),
+                    worker.id.bytes,
+                    worker,
+                    goal,
+                )
+            )
+        movers.sort(key=lambda item: item[:3])
+
+        rescued = 0
+        probes = 0
+        for _, _, _, worker, goal in movers:
+            if rescued >= TRAFFIC_CONTROL_MAX_RESCUES_PER_TICK:
+                break
+            if probes >= TRAFFIC_CONTROL_MAX_PROBES_PER_TICK:
+                break
+            if not self._worker_locally_trapped(turn, planner, worker, goal):
+                continue
+            probes += 1
+            if planner.path_for(
+                worker,
+                goal,
+                max_expansions=WORKER_YIELD_PATH_MAX_EXPANSIONS,
+            ):
+                continue
+            terrain_path = planner.terrain_path_for(
+                worker,
+                goal,
+                max_expansions=WORKER_YIELD_PATH_MAX_EXPANSIONS,
+            )
+            if not terrain_path:
+                continue  # 地形本身不通，不是拥堵，不打散阵型
+            route = _route_positions(worker.position, terrain_path)
+            path_cells = frozenset(route)
+            cleared = 0
+            for position in route[1 : TRAFFIC_CONTROL_SCAN_LENGTH + 1]:
+                if planner.final_occupancy(position) < 2:
+                    continue
+                if not self._traffic_push_chain(
+                    turn,
+                    planner,
+                    acted_units,
+                    decisions,
+                    position,
+                    path_cells,
+                    TRAFFIC_CONTROL_PUSH_DEPTH,
+                ):
+                    continue
+                cleared += 1
+                # 腾开一格就复查：能寻到路就收手，不做多余的阵型扰动。
+                if planner.path_for(
+                    worker,
+                    goal,
+                    max_expansions=WORKER_YIELD_PATH_MAX_EXPANSIONS,
+                ):
+                    break
+            if cleared:
+                rescued += 1
+                decisions.append(
+                    f"worker:{_short_id(worker.id)} traffic_control_cleared "
+                    f"cells={cleared} goal={goal}"
+                )
+                self.memory.decision_totals["logistics:traffic_control"] += 1
 
     def _vacate_core_for_logistics(
         self,

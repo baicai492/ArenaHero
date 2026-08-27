@@ -36,6 +36,7 @@
     hoard_stage2: false,
     optimal_spawn_order: false,
     yield_path_to_workers: false,
+    traffic_control: false,
     hoard_on_capacity: false,
     disable_beacon_scout: false,
   };
@@ -471,6 +472,31 @@
     const parts = [];
     if (typeof yields === "number") {
       parts.push(`累计让路 ${yields} 次`);
+    }
+    if (typeof stuck === "number") {
+      parts.push(`累计载货打转 ${stuck} 次`);
+    }
+    return parts.length ? `\n当前生效：${parts.join(" · ")}` : "\n当前生效：已开启";
+  }
+
+  // 通行调度的实时状态：本局累计疏通次数、递归推挤次数与仍在打转的工人数。
+  function trafficControlStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.traffic_control !== "boolean") {
+      return "";
+    }
+    if (!stats.traffic_control) {
+      return "\n当前生效：未开启，拥堵只由「优先给工人让路」的单步让路处理";
+    }
+    const cleared = stats.traffic_control_total;
+    const chained = stats.traffic_yield_chain_total;
+    const stuck = stats.cargo_stuck_total;
+    const parts = [];
+    if (typeof cleared === "number") {
+      parts.push(`累计疏通 ${cleared} 次`);
+    }
+    if (typeof chained === "number") {
+      parts.push(`递归推挤 ${chained} 次`);
     }
     if (typeof stuck === "number") {
       parts.push(`累计载货打转 ${stuck} 次`);
@@ -1096,6 +1122,26 @@
         "\n战斗单位优先让路；载货工人不会被推开。Core 5 格内有敌时不生效，生存优先。" +
         "\n注意：这是 Core 门口腾位（只清 Core 格与 4 个邻格）之外的补充，管更外面的走廊。" +
         yieldPathStatusText(),
+    );
+    addControlCheckbox(
+      panel,
+      "traffic_control",
+      "通行调度",
+      () =>
+        "勾选后启用全局通行调度，处理「优先给工人让路」解决不了的深度拥堵。" +
+        "\n单步让路只找工人通路上第一个满格，只让一个单位往相邻空格挪一步。" +
+        "防守单位一多，相邻格也是满的，让路当场失败；就算成功，通路上后面几个满格" +
+        "仍然堵着，工人这一 Tick 照样寻不到路——所以开不开让路都会看到工人原地打转。" +
+        "\n通行调度改成三件事：" +
+        "\n① 沿工人通路往前扫 12 格，把途中每一个满格都尝试腾开，不是只处理第一个；" +
+        "\n② 挡路单位四周也满时，先递归把外层单位推开腾出落脚点，再让它挪进去（最多 2 层），" +
+        "一次调度可以推动一串单位；" +
+        "\n③ 每腾开一格就复查工人是否已经能寻到路，能走就立刻收手，不做多余的阵型扰动。" +
+        "\n调度顺序：载货优先，同类里离目标近的优先——近的先走能把走廊从出口往里逐段腾空。" +
+        "\n判定与让路一致：只有「地形通、占用不通」才算拥堵，纯地形死路不触发；" +
+        "载货工人不会被推开；Core 5 格内有敌时整体让位于生存。" +
+        "\n可与「优先给工人让路」同时开启：简单拥堵由让路先解决，剩下的才走调度器。" +
+        trafficControlStatusText(),
     );
     addControlNumber(
       panel,

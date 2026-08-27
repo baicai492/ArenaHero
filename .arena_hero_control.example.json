@@ -16,6 +16,7 @@
   "hoard_stage2": false,
   "optimal_spawn_order": false,
   "yield_path_to_workers": false,
+  "traffic_control": false,
   "hoard_on_capacity": false,
   "disable_beacon_scout": false,
   "target_population": 20,

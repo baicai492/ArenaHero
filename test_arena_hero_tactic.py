@@ -9796,6 +9796,205 @@ class WorkerYieldPathTests(unittest.TestCase):
         self.assertTrue(memory.yield_path_to_workers)
 
 
+class GreedyFallbackAntiOscillationTests(unittest.TestCase):
+    """完整寻路失败后的单步贪心必须反打转。
+
+    贪心只看「哪一步离目标最近」。当唯一能靠近目标的格子被挡住时，四周所有候选
+    都在增加距离、评分相同，贪心按固定方向序挑一个；下个 Tick 从新格子看回来，
+    原来那一格又成了同分最优，于是在两格之间无限来回。实测工人这样卡了上千个
+    Tick，并且每来回一次就给这两格的 `visited` +1，把寻路代价越推越高。
+    """
+
+    # 目标四周封死 → 完整寻路必然失败，逼出单步贪心分支；(0,-1) 再堵死唯一
+    # 能靠近目标的邻格，让剩下三个候选评分完全相同，暴露方向序的固定偏好。
+    _UNREACHABLE_GOAL = (0, -10)
+    _GOAL_WALL = ((0, -9), (0, -11), (1, -10), (-1, -10))
+
+    def _planner_and_worker(self, previous, *, extra_obstacles=()):
+        memory = TacticMemory()
+        if previous is not None:
+            # observe() 每 Tick 追加当前位置；末位是本 Tick，倒数第二位是上一 Tick。
+            memory.recent_positions[str(WORKER_LOW)] = [previous, (0, 0)]
+        turn, _ = make_turn(
+            own_core=core((0, 6)),
+            units=(worker(WORKER_LOW, (0, 0)),),
+            obstacle_cells=((0, -1),) + self._GOAL_WALL + tuple(extra_obstacles),
+            resources=0,
+        )
+        planner = MovementPlanner(turn, memory, [])
+        unit = next(u for u in turn.workers if u.id == WORKER_LOW)
+        return planner, unit
+
+    def test_fallback_avoids_stepping_back_to_previous_cell(self) -> None:
+        planner, unit = self._planner_and_worker(previous=(1, 0))
+
+        self.assertTrue(planner.toward(unit, self._UNREACHABLE_GOAL, "probe"))
+
+        route = planner.memory.current_routes[str(WORKER_LOW)]
+        self.assertTrue(route.reason.endswith(":fallback"), route.reason)
+        # 三个候选 (1,0)/(0,1)/(-1,0) 到目标都是 11，同分。不修的话方向序里
+        # RIGHT 排在 DOWN 前面会走回 (1,0)——正是上一个 Tick 来的地方。
+        self.assertNotEqual(route.path[1], (1, 0))
+
+    def test_fallback_still_backtracks_when_it_is_the_only_option(self) -> None:
+        """1 格宽死胡同里回头是唯一可行步，反打转不能把单位钉死。"""
+
+        planner, unit = self._planner_and_worker(
+            previous=(1, 0),
+            extra_obstacles=((0, 1), (-1, 0)),
+        )
+
+        self.assertTrue(planner.toward(unit, self._UNREACHABLE_GOAL, "probe"))
+
+        route = planner.memory.current_routes[str(WORKER_LOW)]
+        self.assertEqual(route.path[1], (1, 0))
+
+
+class TrafficControlTests(unittest.TestCase):
+    """通行调度（control `traffic_control`）：沿整条通路清障 + 递归推挤。
+
+    单步让路只让挡路单位往**相邻空格**挪一步。防守单位一多，相邻格也是满的，
+    让路当场失败，工人继续打转——这正是实测中开不开让路都卡住的原因。调度器改成
+    先递归把外层单位推开腾出落脚点，再让挡路单位挪进去。
+    """
+
+    # 1 格宽走廊 Core(0,0) ← … ← (5,0)，外加一个 2 格深的口袋 (3,1)→(3,2)。
+    # 口袋第一格被占满，只有递归推挤才能把它腾出来。
+    _OBSTACLES = (
+        (-1, 0),
+        (6, 0),
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (4, 1),
+        (5, 1),
+        (0, -1),
+        (1, -1),
+        (2, -1),
+        (3, -1),
+        (4, -1),
+        (5, -1),
+        (2, 2),
+        (4, 2),
+        (3, 3),
+    )
+
+    def _run(self, *, traffic_control: bool, yield_path: bool):
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "develop",
+                        "yield_path_to_workers": yield_path,
+                        "traffic_control": traffic_control,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (4, 0), cargo=1),
+                    # 走廊被占满
+                    vanguard((3, 0), VANGUARD_ID),
+                    vanguard((3, 0), VANGUARD_TWO_ID),
+                    # 唯一的避让口袋第一格也被占满 → 单步让路无处可去
+                    vanguard((3, 1), VANGUARD_THREE_ID),
+                    vanguard((3, 1), VANGUARD_FOURTH_ID),
+                ),
+                obstacle_cells=self._OBSTACLES,
+                resources=0,
+            )
+            summary = SmartTactic(
+                memory, control_path=control_path
+            ).choose_actions(turn)
+        return memory, summary
+
+    def test_chain_push_clears_corridor_when_pocket_is_full(self) -> None:
+        memory, summary = self._run(traffic_control=True, yield_path=False)
+
+        self.assertTrue(
+            any("traffic_yield:chain" in item for item in summary.decisions),
+            summary.decisions,
+        )
+        # 外层单位先被推进口袋深处 (3,2)，腾出 (3,1)
+        outer = [
+            route
+            for route in memory.current_routes.values()
+            if route.reason == "traffic_yield"
+        ]
+        self.assertTrue(outer, memory.current_routes)
+        self.assertEqual(outer[0].path[-1], (3, 2))
+        # 挡在走廊上的单位随后挪进 (3,1)，走廊让出来
+        inner = [
+            route
+            for route in memory.current_routes.values()
+            if route.reason == "traffic_yield:chain"
+        ]
+        self.assertEqual(len(inner), 1, inner)
+        self.assertEqual(inner[0].path[-1], (3, 1))
+
+    def test_single_step_yield_alone_cannot_clear_full_pocket(self) -> None:
+        """对照：只开单步让路时口袋已满，让不动，复现现场的打转。"""
+
+        _, summary = self._run(traffic_control=False, yield_path=True)
+
+        self.assertFalse(
+            any("yield_path_to_worker" in item for item in summary.decisions),
+            summary.decisions,
+        )
+        self.assertFalse(
+            any("traffic_yield" in item for item in summary.decisions),
+            summary.decisions,
+        )
+
+    def test_disabled_by_default_and_reads_from_control(self) -> None:
+        memory = TacticMemory()
+        self.assertFalse(memory.traffic_control)
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "traffic_control": True}),
+                encoding="utf-8",
+            )
+            memory.load_control(control_path)
+        self.assertTrue(memory.traffic_control)
+
+    def test_enemy_near_core_suspends_traffic_control(self) -> None:
+        """Core 近端有敌时不为物流打散阵型，生存优先。"""
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop", "traffic_control": True}),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(
+                    worker(WORKER_LOW, (4, 0), cargo=1),
+                    vanguard((3, 0), VANGUARD_ID),
+                    vanguard((3, 0), VANGUARD_TWO_ID),
+                    vanguard((3, 1), VANGUARD_THREE_ID),
+                    vanguard((3, 1), VANGUARD_FOURTH_ID),
+                ),
+                enemies=(enemy_ranger((2, 0)),),
+                obstacle_cells=self._OBSTACLES,
+                resources=0,
+            )
+            summary = SmartTactic(
+                memory, control_path=control_path
+            ).choose_actions(turn)
+
+        self.assertFalse(
+            any("traffic_yield" in item for item in summary.decisions),
+            summary.decisions,
+        )
+
+
 class HoardGateTests(unittest.TestCase):
     """囤积触发条件：容量判定（`hoard_on_capacity`）与 30 之后的通用水位。"""
 
