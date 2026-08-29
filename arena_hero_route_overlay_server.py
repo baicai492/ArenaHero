@@ -146,6 +146,8 @@ EMPTY_STATS = {
     "traffic_control_total": 0,
     "traffic_yield_total": 0,
     "traffic_yield_chain_total": 0,
+    "vacate_resource_cell_total": 0,
+    "vacate_resource_cell_chain_total": 0,
     "cargo_queue_hold_total": 0,
     "manual_overrides": 0,
     "event_totals": {},

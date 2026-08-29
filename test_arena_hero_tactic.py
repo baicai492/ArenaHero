@@ -9850,6 +9850,129 @@ class GreedyFallbackAntiOscillationTests(unittest.TestCase):
         self.assertEqual(route.path[1], (1, 0))
 
 
+class VacateResourceCellTests(unittest.TestCase):
+    """占住水晶、自己又采不了的单位必须挪开。
+
+    采集要求工人站在水晶格上，而每格最多 2 个实体。一颗水晶被两个采不了的单位
+    （战斗单位、或已载货的工人）占住时就永久采不到——摆位规则里没有任何条件会把
+    它们挪走，因为 `_terrain_guard_offsets` 只排斥障碍格、不认水晶格。
+    """
+
+    def _run(self, units, *, enemies=(), obstacle_cells=()):
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps({"mode": "develop"}), encoding="utf-8"
+            )
+            memory = TacticMemory()
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=units,
+                enemies=enemies,
+                resource_cells=((5, 0),),
+                obstacle_cells=obstacle_cells,
+                resources=0,
+            )
+            summary = SmartTactic(
+                memory, control_path=control_path
+            ).choose_actions(turn)
+        return memory, summary
+
+    def test_combat_unit_vacates_full_resource_cell(self) -> None:
+        memory, summary = self._run(
+            units=(
+                vanguard((5, 0), VANGUARD_ID),
+                vanguard((5, 0), VANGUARD_TWO_ID),
+                worker(WORKER_LOW, (4, 0)),
+            )
+        )
+
+        self.assertTrue(
+            any("resource_cell_vacated at=(5, 0)" in item for item in summary.decisions),
+            summary.decisions,
+        )
+        moved = [
+            route
+            for route in memory.current_routes.values()
+            if route.reason == "vacate_resource_cell"
+        ]
+        self.assertEqual(len(moved), 1, moved)
+        self.assertEqual(moved[0].start, (5, 0))
+
+    def test_no_vacate_when_empty_worker_already_there(self) -> None:
+        """已有空载工人站着，这一 Tick 就会被它采走，不该扰动阵型。"""
+
+        _, summary = self._run(
+            units=(
+                worker(WORKER_LOW, (5, 0)),
+                vanguard((5, 0), VANGUARD_ID),
+            )
+        )
+
+        self.assertFalse(
+            any("resource_cell_vacated" in item for item in summary.decisions),
+            summary.decisions,
+        )
+
+    def test_no_vacate_when_cell_has_room(self) -> None:
+        """占用未满，工人自己能进来，不需要让开。"""
+
+        _, summary = self._run(
+            units=(
+                vanguard((5, 0), VANGUARD_ID),
+                worker(WORKER_LOW, (4, 0)),
+            )
+        )
+
+        self.assertFalse(
+            any("resource_cell_vacated" in item for item in summary.decisions),
+            summary.decisions,
+        )
+
+    def test_cargo_worker_also_vacates(self) -> None:
+        """载货工人自己采不了，占着水晶格就是纯浪费，必须也能被挪开。
+
+        这是让开水晶格与通行调度的关键差异：通行调度不推载货工人（会打断回仓），
+        这里必须推。
+        """
+
+        memory, summary = self._run(
+            units=(
+                worker(WORKER_LOW, (5, 0), cargo=1),
+                worker(WORKER_HIGH, (5, 0), cargo=1),
+                worker(WORKER_THIRD, (4, 0)),
+            )
+        )
+
+        self.assertTrue(
+            any("resource_cell_vacated at=(5, 0)" in item for item in summary.decisions),
+            summary.decisions,
+        )
+        moved = [
+            route
+            for route in memory.current_routes.values()
+            if route.reason == "vacate_resource_cell"
+        ]
+        self.assertEqual(len(moved), 1, moved)
+
+    def test_enemy_near_resource_suspends_vacate(self) -> None:
+        """水晶近端有敌时不动，游侠可能正需要站在那儿输出。"""
+
+        _, summary = self._run(
+            units=(
+                vanguard((5, 0), VANGUARD_ID),
+                vanguard((5, 0), VANGUARD_TWO_ID),
+                worker(WORKER_LOW, (4, 0)),
+            ),
+            enemies=(enemy_ranger((6, 0)),),
+        )
+
+        self.assertFalse(
+            any("resource_cell_vacated" in item for item in summary.decisions),
+            summary.decisions,
+        )
+
+
 class TrafficControlTests(unittest.TestCase):
     """通行调度（control `traffic_control`）：沿整条通路清障 + 递归推挤。
 

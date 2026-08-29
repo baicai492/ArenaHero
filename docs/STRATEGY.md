@@ -59,7 +59,23 @@ Core 格容量只有 2，包括 Core 自身，因此同一时间只能容纳 1 �
 
 两个开关可以同时开：简单拥堵由单步让路先解决，剩下的才走调度器。诊断看 `traffic_control_total`（疏通次数）、`traffic_yield_chain_total`（递归推挤次数）与 `cargo_stuck_total`。递归推挤占比高说明拥堵已经深到单步让路根本处理不了。
 
-### 2.1.3 寻路退化与打转
+### 2.1.3 让开水晶格
+
+采集要求工人**站在水晶格上**（`_choose_workers` 按 `worker.position == position` 挑采集者），而每格最多容纳 2 个实体。于是一颗水晶被两个采不了的单位占住（两个战斗单位，或战斗单位 + 已载货工人）时就**永久采不到**——摆位规则里没有任何条件会把它们挪走。
+
+根因是摆位不认水晶格：`_terrain_guard_offsets` 只排斥障碍格，游侠射击位与召回阵位都只看地形与威胁。让路与停车位选择虽然会避免**移入**水晶格，但对已经站在上面的单位无能为力。
+
+`_vacate_resource_cells_for_workers` 无条件生效（不需要开关），排在 `_choose_workers` 之前——占位单位这一 Tick 就走，工人同一 Tick 即可进场采集，不用白等一轮。触发条件收得很窄，避免无谓扰动阵型：
+
+- **格子已满**（占用 ≥ 2）。未满时工人自己能进来，不需要动。
+- **上面没有空载工人**。有的话这一 Tick 就会被它采走。
+- **水晶 5 格内没有敌人**。游侠可能正需要站在那儿输出，战斗优先。
+
+三条同时满足才动手，也就是确认这颗水晶这一 Tick 铁定采不了。让开顺序是战斗单位优先、载货工人其次（后者本来就要回仓，且自己采不了）。
+
+腾位复用通行调度的递归推挤（`_traffic_push_chain`），所以「挡路单位四周也满」不再是让开失败的理由。诊断看 `vacate_resource_cell_total` 与 `vacate_resource_cell_chain_total`：前者持续增长说明摆位规则经常把单位放到水晶上，更根本的修法是让射击位与召回阵位一开始就规避水晶格；后者占比高说明水晶周边普遍拥挤。
+
+### 2.1.4 寻路退化与打转
 
 工人长期在两格之间来回走、货卸不掉，最常见的原因**不是**让路失败，而是寻路本身退化。三个独立成因都已修复：
 
@@ -341,7 +357,7 @@ Arena Hero 服务器按对象合并计划：Manual 显式动作 > Agent 显式�
 |---|---|
 | 经济 | `harvest_count`、`deposit_count`、`worker_cargo`、可见/已知资源格 |
 | 产兵 | `units_built`、当前人口、下一兵种动态成本、Core 是否移动 |
-| 物流 | `cargo_queue_hold`、`cargo_stuck`、`vacate_core_for_logistics`、`yield_path_to_worker`、`traffic_control`、`traffic_yield_chain` |
+| 物流 | `cargo_queue_hold`、`cargo_stuck`、`vacate_core_for_logistics`、`yield_path_to_worker`、`traffic_control`、`traffic_yield_chain`、`resource_cell_vacated`、`vacate_resource_cell_chain` |
 | 战斗 | 主力编队半径、命中/落空、伤亡、Core 摧毁和资源缴获 |
 | 稳定性 | accepted=false、`UNIT_MOVE_FAILED`、`CORE_MOVE_FAILED`、`agent_err.log` |
 

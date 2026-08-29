@@ -2854,6 +2854,14 @@ class TacticMemory:
                 "traffic_yield_chain_total": self.decision_totals.get(
                     "logistics:traffic_yield_chain", 0
                 ),
+                # 让开水晶格诊断：这个数持续增长说明摆位规则经常把单位放到水晶上，
+                # 更根本的修法是让射击位/召回阵位一开始就规避水晶格。
+                "vacate_resource_cell_total": self.decision_totals.get(
+                    "logistics:resource_cell_vacated", 0
+                ),
+                "vacate_resource_cell_chain_total": self.decision_totals.get(
+                    "logistics:vacate_resource_cell_chain", 0
+                ),
                 "cargo_queue_hold_total": self.decision_totals.get(
                     "worker:cargo_queue_hold", 0
                 ),
@@ -3723,6 +3731,14 @@ class SmartTactic:
         # 通行调度同理，且排在单步让路之后：单步让路能解决的简单拥堵先解决掉，
         # 剩下真正需要递归推挤的才交给调度器，避免两套机制在同一格上互相覆盖。
         self._traffic_control_schedule(
+            turn,
+            planner,
+            acted_units,
+            decisions,
+        )
+        # 让开水晶格也必须在 _choose_workers 之前：占位单位这一 Tick 就离开，
+        # 工人同一 Tick 即可进场采集，而不是白等一轮。
+        self._vacate_resource_cells_for_workers(
             turn,
             planner,
             acted_units,
@@ -4610,6 +4626,9 @@ class SmartTactic:
         blocker_cell: Position,
         path_cells: frozenset[Position],
         depth: int,
+        *,
+        reason: str = "traffic_yield",
+        allow_cargo_workers: bool = False,
     ) -> bool:
         """腾出 `blocker_cell` 的一个名额；相邻格也满时递归把外层单位先推开。
 
@@ -4617,6 +4636,11 @@ class SmartTactic:
         格」，人口一多答案基本都是「没有」，于是让路失败、工人继续打转。这里改成
         先递归给挡路单位腾出一个落脚点，再让它挪过去——一次调度可以推动一串单位，
         深度由 `TRAFFIC_CONTROL_PUSH_DEPTH` 限制，避免把整个阵型搅散。
+
+        `reason` 与 `allow_cargo_workers` 让让开水晶格复用同一套递归，而不是抄一
+        遍：前者作为决策文本与统计计数的前缀（区分「为通行推挤」和「为采集推
+        挤」），后者控制是否允许推动载货工人——通行时不推（会打断回仓），但清理
+        水晶格时必须推，因为载货工人自己采不了、占着格子就是纯浪费。
         """
 
         candidates = [
@@ -4624,7 +4648,9 @@ class SmartTactic:
             for unit in turn.units
             if unit.position == blocker_cell
             and unit.id not in acted_units
-            and not (isinstance(unit, Worker) and unit.cargo)
+            and not (
+                isinstance(unit, Worker) and unit.cargo and not allow_cargo_workers
+            )
         ]
         # 战斗单位先让：空载工人挪开后往往又被自己的采集目标拉回原格。
         candidates.sort(key=lambda unit: (isinstance(unit, Worker), unit.id.bytes))
@@ -4634,15 +4660,15 @@ class SmartTactic:
             if target is not None and planner.toward(
                 blocker,
                 target,
-                "traffic_yield",
+                reason,
                 avoid=tuple(path_cells),
             ):
                 acted_units.add(blocker.id)
                 decisions.append(
                     f"{blocker.view.unit_type.value.lower()}:{_short_id(blocker.id)} "
-                    f"traffic_yield cell={blocker_cell} aside={target}"
+                    f"{reason} cell={blocker_cell} aside={target}"
                 )
-                self.memory.decision_totals["logistics:traffic_yield"] += 1
+                self.memory.decision_totals[f"logistics:{reason}"] += 1
                 return True
             if depth <= 0:
                 continue
@@ -4668,23 +4694,86 @@ class SmartTactic:
                     neighbour,
                     path_cells,
                     depth - 1,
+                    reason=reason,
+                    allow_cargo_workers=allow_cargo_workers,
                 ):
                     continue
                 if planner.toward(
                     blocker,
                     neighbour,
-                    "traffic_yield:chain",
+                    f"{reason}:chain",
                     avoid=tuple(path_cells),
                 ):
                     acted_units.add(blocker.id)
                     decisions.append(
                         f"{blocker.view.unit_type.value.lower()}:"
-                        f"{_short_id(blocker.id)} traffic_yield:chain "
+                        f"{_short_id(blocker.id)} {reason}:chain "
                         f"cell={blocker_cell} aside={neighbour} depth={depth}"
                     )
-                    self.memory.decision_totals["logistics:traffic_yield_chain"] += 1
+                    self.memory.decision_totals[f"logistics:{reason}_chain"] += 1
                     return True
         return False
+
+    def _vacate_resource_cells_for_workers(
+        self,
+        turn: Turn,
+        planner: MovementPlanner,
+        acted_units: set[UUID],
+        decisions: list[str],
+    ) -> None:
+        """把占住水晶、自己又采不了的单位挪开。
+
+        采集要求工人**站在水晶格上**（`_choose_workers` 里按 `worker.position ==
+        position` 挑采集者），而每格最多容纳 2 个实体。于是一颗水晶被两个采不了的
+        单位（战斗单位、或已载货的工人）占住时，就**永久采不到**——摆位规则里没有
+        任何条件会把它们挪走。
+
+        根因是摆位不认水晶格：`_terrain_guard_offsets` 只排斥障碍格，游侠射击位与
+        召回阵位都只看地形与威胁。让路/停车位选择虽然会避免**移入**水晶格，但对
+        已经站在上面的单位无能为力。
+
+        触发条件收得很窄，避免无谓扰动阵型：只有「格子已满 + 上面没有空载工人」
+        才动手——也就是确认这颗水晶这一 Tick 铁定采不了。让开顺序是战斗单位优先、
+        载货工人其次（后者本来就要回仓）。水晶 5 格内有敌时不动，游侠可能正需要
+        站在那儿输出。
+
+        腾位复用通行调度的递归推挤，所以「四周也满」不再是让开失败的理由。
+        """
+
+        if not turn.resource_cells:
+            return
+        occupants: dict[Position, list[Unit]] = {}
+        for unit in turn.units:
+            occupants.setdefault(unit.position, []).append(unit)
+
+        for position in sorted(turn.resource_cells):
+            if planner.final_occupancy(position) < 2:
+                continue  # 还有位，工人自己能进来
+            here = occupants.get(position, ())
+            if any(
+                isinstance(unit, Worker) and not unit.cargo for unit in here
+            ):
+                continue  # 已经有空载工人站着，这一 Tick 就会被它采走
+            if any(
+                _distance(position, enemy.position) <= WORKER_YIELD_CORE_THREAT_RADIUS
+                for enemy in turn.visible_enemies
+            ):
+                continue  # 战斗优先
+            # 只保护这一格本身，让递归推挤可以把外层单位推到别处。
+            if not self._traffic_push_chain(
+                turn,
+                planner,
+                acted_units,
+                decisions,
+                position,
+                frozenset({position}),
+                TRAFFIC_CONTROL_PUSH_DEPTH,
+                reason="vacate_resource_cell",
+                allow_cargo_workers=True,
+            ):
+                continue
+            decisions.append(f"resource_cell_vacated at={position}")
+            self.memory.decision_totals["logistics:resource_cell_vacated"] += 1
 
     def _traffic_control_schedule(
         self,
