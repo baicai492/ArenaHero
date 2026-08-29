@@ -325,7 +325,9 @@ Invoke-RestMethod http://127.0.0.1:8765/stats
 
 策略里已内置自动让开，无需开关，日志会打 `resource_cell_vacated at=(x, y)`。触发条件是「格子已满 + 上面没有空载工人 + 水晶 5 格内无敌」三条同时满足，即确认这颗水晶这一 Tick 铁定采不了；有敌时按战斗优先不动。腾位会递归推挤，所以挡路单位四周也满时依然能让开。细节见 [STRATEGY.md 2.1.3](STRATEGY.md#213-让开水晶格)。
 
-看 `vacate_resource_cell_total`：持续增长说明摆位规则经常把单位放到水晶上，根治要让射击位与召回阵位一开始就规避水晶格。某颗水晶长期没有采集记录、又没出现 `resource_cell_vacated`，那更可能是采集距离上限（`resource_leash_distance`）、临时封锁未解除或空载工人不够，不是被占住。
+摆位那边也做了源头规避：召回位、警戒位与 Core 巡逻位现在会把落在水晶上的阵位排到最后（只降优先级，水晶多时仍可站，否则单位无处可去）。所以正常情况下 `vacate_resource_cell_total` 应该维持在很低的水平。
+
+看 `vacate_resource_cell_total`：若仍持续增长，说明单位是被别的规则（射击位、追击、护送）带到水晶上的，顺着决策日志找那条规则。某颗水晶长期没有采集记录、又没出现 `resource_cell_vacated`，那更可能是采集距离上限（`resource_leash_distance`）、临时封锁未解除或空载工人不够，不是被占住。
 
 ### API Key 无法解密
 

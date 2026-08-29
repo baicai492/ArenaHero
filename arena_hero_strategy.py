@@ -2952,19 +2952,43 @@ def _terrain_guard_offsets(
     anchor: Position,
     obstacles: set[Position],
     offsets: tuple[Position, ...],
+    resource_cells: Iterable[Position] = (),
 ) -> tuple[Position, ...]:
-    """Prefer Core guard slots on the open half of a rock-backed position."""
+    """Prefer Core guard slots on the open half of a rock-backed position.
+
+    `resource_cells` 把落在水晶上的阵位排到最后。采集要求工人站在水晶格上、每格
+    上限 2 个实体，所以召回阵位一旦占住水晶，再来一个单位这颗水晶就永久采不到
+    （见 `_vacate_resource_cells_for_workers`）。那边是事后把人赶走，这里是一开始
+    就别站上去，能直接减少让开的触发次数。
+
+    只降优先级、不排除：阵位是固定的 8 个偏移，水晶多的时候硬排除会让单位无处
+    可站，反而把阵型打散。排到最后即「有别的位就不占水晶，只剩水晶时仍然可用」。
+    """
+
     open_count, open_axis, concentrated_count, _ = _core_attack_surface_profile(
         anchor,
         obstacles,
     )
+    resource_set = set(resource_cells)
+
+    def _resource_last(ordered: tuple[Position, ...]) -> tuple[Position, ...]:
+        if not resource_set:
+            return ordered
+        clear = [
+            offset
+            for offset in ordered
+            if (anchor[0] + offset[0], anchor[1] + offset[1]) not in resource_set
+        ]
+        on_resource = [offset for offset in ordered if offset not in clear]
+        return tuple(clear + on_resource)
+
     if (
         open_axis is None
         or open_count > MIGRATION_SITE_MAX_OPEN_RANGED_CELLS
         or concentrated_count * MIGRATION_SITE_MIN_OPEN_HALF_RATIO_DENOMINATOR
         < open_count * MIGRATION_SITE_MIN_OPEN_HALF_RATIO_NUMERATOR
     ):
-        return offsets
+        return _resource_last(offsets)
     axis_x, axis_y = open_axis
     open_half = [
         offset
@@ -2972,7 +2996,9 @@ def _terrain_guard_offsets(
         if offset[0] * axis_x + offset[1] * axis_y >= 0
     ]
     blocked_half = [offset for offset in offsets if offset not in open_half]
-    return tuple(open_half + blocked_half)
+    # 地形优先级在外、水晶规避在内：先保住「朝开阔面」这个战术判断，再在同一半
+    # 边内部把水晶格往后挪。
+    return _resource_last(tuple(open_half)) + _resource_last(tuple(blocked_half))
 
 
 def _sign(value: int) -> int:
@@ -9759,6 +9785,7 @@ class SmartTactic:
                 AGGRESS_VANGUARD_ALERT_OFFSETS
                 if core_alert
                 else AGGRESS_VANGUARD_WATCH_OFFSETS,
+                turn.resource_cells,
             ),
         )
         core_target = self._pick_enemy_core_target(turn)
@@ -10300,6 +10327,7 @@ class SmartTactic:
             core_position,
             planner.obstacles,
             VANGUARD_RECALL_OFFSETS,
+            turn.resource_cells,
         )
         logistics_corridor = _core_logistics_corridor(
             core_position,
@@ -10561,6 +10589,7 @@ class SmartTactic:
                 AGGRESS_RANGER_ALERT_OFFSETS
                 if core_alert
                 else AGGRESS_RANGER_WATCH_OFFSETS,
+                turn.resource_cells,
             ),
         )
         core_target = self._pick_enemy_core_target(turn)
@@ -11373,6 +11402,7 @@ class SmartTactic:
             turn.core.position if turn.core is not None else (0, 0),
             planner.obstacles,
             RANGER_RECALL_OFFSETS,
+            turn.resource_cells,
         )
         patrol_rangers = ordered_rangers[: min(CORE_PATROL_RANGER_COUNT * 2, len(ordered_rangers))]
         patrol_slots = self._core_patrol_slots(turn, planner, patrol_rangers)
@@ -11662,6 +11692,7 @@ class SmartTactic:
                 (0, CORE_PATROL_RADIUS),
                 (-CORE_PATROL_RADIUS, 0),
             ),
+            turn.resource_cells,
         )
         open_count, open_axis, concentrated_count, _ = _core_attack_surface_profile(
             turn.core.position,

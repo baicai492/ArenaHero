@@ -9850,6 +9850,40 @@ class GreedyFallbackAntiOscillationTests(unittest.TestCase):
         self.assertEqual(route.path[1], (1, 0))
 
 
+class GuardOffsetResourceAvoidanceTests(unittest.TestCase):
+    """召回阵位规避水晶格：只降优先级，不排除。
+
+    阵位一旦占住水晶，再来一个单位这颗水晶就永久采不到。
+    `_vacate_resource_cells_for_workers` 是事后赶人，这里是一开始就别站上去。
+    """
+
+    def test_resource_slots_sort_last(self) -> None:
+        anchor = (0, 0)
+        offsets = ((1, 0), (0, 1), (-1, 0), (0, -1))
+
+        ordered = _terrain_guard_offsets(anchor, set(), offsets, {(1, 0), (-1, 0)})
+
+        # 干净的阵位在前，落在水晶上的排到最后
+        self.assertEqual(ordered[:2], ((0, 1), (0, -1)))
+        self.assertEqual(set(ordered[2:]), {(1, 0), (-1, 0)})
+
+    def test_resource_slots_still_usable_when_all_on_resources(self) -> None:
+        """全是水晶时不能把阵位清空，否则单位无处可站、阵型被打散。"""
+
+        anchor = (0, 0)
+        offsets = ((1, 0), (0, 1))
+
+        ordered = _terrain_guard_offsets(anchor, set(), offsets, {(1, 0), (0, 1)})
+
+        self.assertEqual(set(ordered), set(offsets))
+
+    def test_no_resource_cells_leaves_order_untouched(self) -> None:
+        anchor = (0, 0)
+        offsets = ((1, 0), (0, 1), (-1, 0), (0, -1))
+
+        self.assertEqual(_terrain_guard_offsets(anchor, set(), offsets), offsets)
+
+
 class VacateResourceCellTests(unittest.TestCase):
     """占住水晶、自己又采不了的单位必须挪开。
 
