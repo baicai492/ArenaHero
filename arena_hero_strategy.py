@@ -139,6 +139,9 @@ POST_RECALL_SWEEP_READY_DENOMINATOR = 5
 # army rebuilding more than the extra vision helps.
 # 2026-08-11: 视野内无资源时持续螺旋外扩。原 28 导致 core 周围荒漠时工人空转；
 # 160 让工人能逐圈推进到 160 格，触达最近真实富矿区。
+# 2026-08-29 改为控制文件 worker_search_max_radius 的默认值，可在叠加层面板调整。
+# 调大：Core 周围采空后工人能走更远找富矿，代价是单程时间变长、回仓周期变慢，
+# 且远端工人更容易脱离防守范围。调小：工人守在近处，采空后容易空转。
 DEVELOP_WIDE_SEARCH_MAX_RADIUS = 160
 # 2026-08-12: develop_local_recall 的"当地范围"判定与探索半径解耦。
 # 初设 28，后放宽 48；核心迁至 (137,-98) 后附近富矿锚点（chunk(5,-5) 采过 135 次
@@ -1099,6 +1102,8 @@ class TacticMemory:
     browser_scout_limit: int = DEFAULT_BROWSER_SCOUT_LIMIT
     # 2026-08-24 采集目标距 Core 的上限（control 配置）；已走到矿点 3 格内的工人例外。
     resource_leash_distance: int = DEFAULT_RESOURCE_LEASH_DISTANCE
+    # 2026-08-29 工人螺旋外扩找矿的半径上限（control 配置）。0 = 用默认 160。
+    worker_search_max_radius: int = DEVELOP_WIDE_SEARCH_MAX_RADIUS
     unit_label_mapping: dict[str, str] = field(default_factory=dict)
     last_events: list[dict] = field(default_factory=list)
     unit_positions_for_overlay: dict[str, Position] = field(default_factory=dict)
@@ -2236,6 +2241,16 @@ class TacticMemory:
                 self.recent_positions.pop(uid, None)
         self.last_tick = turn.tick
 
+    def effective_worker_search_max_radius(self) -> int:
+        """工人螺旋外扩找矿的半径上限；0 视为用默认值。
+
+        与 `resource_leash_distance` 的区别：那个管「已发现的水晶值不值得去采」，
+        这个管「没发现水晶时最多往外铺多大的搜索圈」。两者独立——搜索圈铺得再大，
+        走到跟前的水晶仍然要过 leash 那道筛。
+        """
+
+        return self.worker_search_max_radius or DEVELOP_WIDE_SEARCH_MAX_RADIUS
+
     def remember_move(self, unit: Unit, destination: Position, tick: int) -> None:
         self.planned_moves[str(unit.id)] = PlannedMove(destination=destination, tick=tick)
 
@@ -2381,6 +2396,7 @@ class TacticMemory:
                 "browser_scout_limit",
                 "resource_leash_distance",
                 "hoard_target_after_30",
+                "worker_search_max_radius",
             ):
                 raw_value = data.get(key)
                 if isinstance(raw_value, (int, float)) and not isinstance(
@@ -2691,6 +2707,10 @@ class TacticMemory:
                 "browser_hint_distance": self.browser_hint_distance,
                 "browser_scout_limit": self.browser_scout_limit,
                 "resource_leash_distance": self.resource_leash_distance,
+                "worker_search_max_radius": self.worker_search_max_radius,
+                "effective_worker_search_max_radius": (
+                    self.effective_worker_search_max_radius()
+                ),
                 # 死区诊断：提示能发现、但走到后会被采集 leash 剔除的坐标数。
                 # 面板 tooltip 直接显示它，方便一眼看出两个半径的配置矛盾。
                 "browser_hints_beyond_leash": (
@@ -5882,7 +5902,7 @@ class SmartTactic:
                         else AGGRESS_RESOURCE_SWEEP_MAX_RADIUS
                     )
             else:
-                search_leash = DEVELOP_WIDE_SEARCH_MAX_RADIUS
+                search_leash = self.memory.effective_worker_search_max_radius()
             if (
                 goal.kind in {"resource_sweep", "develop_frontier"}
                 and _distance(turn.core.position, goal.position) > search_leash
@@ -6238,7 +6258,9 @@ class SmartTactic:
         if owns_beacon:
             return REFILL_PROBE_CORE_LEASH_DISTANCE
         if self.memory.mode == MODE_DEVELOP:
-            return DEVELOP_REFILL_PROBE_CORE_LEASH_DISTANCE
+            # 跟随探索半径：refill 复查的落点本来就是探索走过的地方，两者用同一个
+            # 上限才不会出现「探索能到、复查却被剪掉」的死区。
+            return self.memory.effective_worker_search_max_radius()
         if self.memory.mode == MODE_AGGRESS:
             return AGGRESS_REFILL_PROBE_CORE_LEASH_DISTANCE
         if self.memory.mode == MODE_BEACON:
@@ -6590,8 +6612,11 @@ class SmartTactic:
                             else DEVELOP_SEARCH_INITIAL_RADIUS
                         ),
                     )
-                next_radius = min(next_radius, DEVELOP_WIDE_SEARCH_MAX_RADIUS)
-                if next_radius >= DEVELOP_WIDE_SEARCH_MAX_RADIUS:
+                search_max_radius = (
+                    self.memory.effective_worker_search_max_radius()
+                )
+                next_radius = min(next_radius, search_max_radius)
+                if next_radius >= search_max_radius:
                     # 外环被障碍/已访问格占满时，补扫内层，避免在少数可走格之间来回。
                     radii = tuple(
                         range(
@@ -6604,7 +6629,7 @@ class SmartTactic:
                     radii = tuple(
                         radius
                         for radius in (next_radius, next_radius + 8, next_radius + 16)
-                        if radius <= DEVELOP_WIDE_SEARCH_MAX_RADIUS
+                        if radius <= search_max_radius
                     )
             if not radii:
                 return None

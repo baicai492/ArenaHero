@@ -3045,6 +3045,82 @@ class BalancedTacticTests(unittest.TestCase):
         self.assertEqual(memory.resource_leash_distance, 56)
         self.assertEqual(memory.browser_scout_limit, 3)
 
+    def test_worker_search_max_radius_reads_from_control_file(self) -> None:
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {"mode": "develop", "worker_search_max_radius": 240}
+                ),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            self.assertEqual(
+                memory.worker_search_max_radius,
+                DEVELOP_WIDE_SEARCH_MAX_RADIUS,
+            )
+            memory.load_control(control_path)
+
+        self.assertEqual(memory.worker_search_max_radius, 240)
+        self.assertEqual(memory.effective_worker_search_max_radius(), 240)
+
+    def test_worker_search_max_radius_zero_falls_back_to_default(self) -> None:
+        """0 表示「用默认值」，不是「不许探索」——后者会让工人彻底空转。"""
+
+        memory = TacticMemory()
+        memory.worker_search_max_radius = 0
+
+        self.assertEqual(
+            memory.effective_worker_search_max_radius(),
+            DEVELOP_WIDE_SEARCH_MAX_RADIUS,
+        )
+
+    def test_worker_search_max_radius_trims_far_search_goal(self) -> None:
+        """收小半径后，超出的旧探索目标要被剪掉，而不是让工人继续走完。"""
+
+        with TemporaryDirectory() as directory:
+            control_path = Path(directory) / ".arena_hero_control.json"
+            control_path.write_text(
+                json.dumps(
+                    {"mode": "develop", "worker_search_max_radius": 40}
+                ),
+                encoding="utf-8",
+            )
+            memory = TacticMemory()
+            memory.worker_goals[str(WORKER_LOW)] = WorkerGoal(
+                "develop_frontier", (100, 0), 0
+            )
+            turn, _ = make_turn(
+                own_core=core((0, 0)),
+                units=(worker(WORKER_LOW, (10, 0)),),
+                resources=0,
+            )
+            summary = SmartTactic(
+                memory, control_path=control_path
+            ).choose_actions(turn)
+
+        self.assertTrue(
+            any("local_search_trim" in item for item in summary.decisions),
+            summary.decisions,
+        )
+        # 剪掉后同一 Tick 会重新分配一个在半径内的目标，而不是让工人闲着。
+        goal = memory.worker_goals.get(str(WORKER_LOW))
+        if goal is not None:
+            self.assertLessEqual(_distance((0, 0), goal.position), 40, goal)
+
+    def test_refill_probe_leash_follows_search_radius(self) -> None:
+        """refill 复查上限跟随探索半径，避免「探索能到、复查被剪」的死区。"""
+
+        memory = TacticMemory()
+        memory.mode = MODE_DEVELOP
+        memory.worker_search_max_radius = 240
+        tactic = SmartTactic(memory)
+
+        self.assertEqual(
+            tactic._refill_probe_core_leash_distance(False),
+            240,
+        )
+
     def test_resource_leash_distance_gates_far_visible_resource(self) -> None:
         """核心回归：leash 决定远处可见资源能否成为采集目标。
 

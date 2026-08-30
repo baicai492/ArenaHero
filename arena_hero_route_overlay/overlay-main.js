@@ -27,6 +27,7 @@
     browser_hint_distance: 32,
     browser_scout_limit: 1,
     resource_leash_distance: 38,
+    worker_search_max_radius: 160,
     hoard_target_after_30: 0,
   };
   const CONTROL_FLAG_DEFAULTS = {
@@ -631,6 +632,37 @@
     return `\n本局累计剔除 ${trimmed} 个超距资源（若近处已无矿，说明可以放宽）`;
   }
 
+  // 探索半径的实时状态：生效值、当前实际铺到多远、以及被本值剪掉的远端目标数。
+  function workerSearchRadiusStatusText() {
+    const stats = state.stats;
+    if (!stats) {
+      return "";
+    }
+    const parts = [];
+    const effective = stats.effective_worker_search_max_radius;
+    const configured = stats.worker_search_max_radius;
+    if (typeof effective === "number") {
+      parts.push(
+        configured === 0
+          ? `生效 ${effective} 格（填 0，用默认值）`
+          : `生效 ${effective} 格`,
+      );
+    }
+    const reached = stats.max_worker_search_radius;
+    if (typeof reached === "number" && reached > 0) {
+      parts.push(`当前已铺到 ${reached} 格`);
+    }
+    const totals = stats.decision_totals;
+    const trimmed =
+      totals && typeof totals["worker:local_search_trim"] === "number"
+        ? totals["worker:local_search_trim"]
+        : null;
+    if (trimmed !== null && trimmed > 0) {
+      parts.push(`累计剪掉 ${trimmed} 个超距探索点`);
+    }
+    return parts.length ? `\n当前生效：${parts.join(" · ")}` : "";
+  }
+
   function browserScoutStatusText() {
     const stats = state.stats;
     if (!stats || typeof stats.browser_resource_hints !== "number") {
@@ -998,6 +1030,23 @@
         deadZoneText() +
         leashTrimStatusText(),
       { maximum: 200, step: 4 },
+    );
+    addControlNumber(
+      panel,
+      "worker_search_max_radius",
+      "工人探索半径",
+      () =>
+        "【develop 发育模式】视野内没有资源时，工人螺旋外扩找矿的半径上限，默认 160 格；0 = 用默认值。" +
+        "\n与「采集目标最大距离」分工不同：那个管「已发现的水晶值不值得去采」，" +
+        "这个管「还没发现水晶时最多往外铺多大的搜索圈」。两者独立——搜索圈铺得再大，" +
+        "走到跟前的水晶仍然要过那道 leash 的筛。" +
+        "\n工人按序号分到 8 个扇形，从 Core 逐圈向外推进，保证各方向都被覆盖；" +
+        "推到上限后会回头补扫内层，避免在少数可走格之间来回。" +
+        "\n调大：Core 周围采空后能走更远找富矿。代价是单程时间变长、回仓周期变慢，" +
+        "远端工人也更容易脱离防守范围。调小：工人守在近处，采空后容易空转。" +
+        "\nrefill 复查的距离上限跟随本值，避免出现「探索能到、复查却被剪掉」的死区。" +
+        workerSearchRadiusStatusText(),
+      { maximum: 400, step: 8 },
     );
     addControlNumber(
       panel,

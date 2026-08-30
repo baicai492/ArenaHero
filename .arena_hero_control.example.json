@@ -29,5 +29,6 @@
   "browser_hint_distance": 32,
   "browser_scout_limit": 1,
   "resource_leash_distance": 38,
+  "worker_search_max_radius": 160,
   "hoard_target_after_30": 0
 }

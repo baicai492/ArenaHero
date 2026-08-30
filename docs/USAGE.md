@@ -191,6 +191,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | 容量够就先攒满 | 囤积改看仓库容量而不是人口门槛 |
 | 30 之后的攒资源目标 | 人口过 30 后的通用水位，所有模式生效 |
 | 禁止头程侦察 | develop 模式下不再主动派 1 先锋 + 1 游侠去信标方向打头阵 |
+| 工人探索半径 | 视野内没有资源时，工人螺旋外扩找矿的半径上限（默认 160 格，0 = 用默认值） |
 
 快捷键：
 
@@ -242,6 +243,7 @@ python arena_hero_route_overlay_server.py --port 8765
 | `browser_hint_distance` | non-negative integer | 浏览器水晶提示的搜索半径（格），默认 32；0 关闭提示。提示来自客户端已探索缓存里标记 `RESOURCE` 的格，含工人已离开视野的水晶；实测近处水晶多在 40~70 格，默认 32 常常用不上 |
 | `browser_scout_limit` | non-negative integer | 每 Tick 最多派几名工人验证提示，默认 1；0 不派人 |
 | `resource_leash_distance` | non-negative integer | develop 模式采集目标距 Core 的上限（格），默认 38；0 取消上限。必须 ≥ `browser_hint_distance`，否则中间那段是「能发现但采不到」的死区 |
+| `worker_search_max_radius` | non-negative integer | develop 模式工人螺旋外扩找矿的半径上限（格），默认 160；0 = 用默认值。管「还没发现水晶时往外铺多大搜索圈」，与 `resource_leash_distance`（管「已发现的水晶值不值得采」）互相独立。refill 复查上限跟随本值 |
 
 后四个字段与两个囤积开关只影响 `develop` 模式，详见 [STRATEGY.md](STRATEGY.md) 的「`develop` 目标编制阶梯与资源囤积」。注意阶梯或囤积生效期间会押后自动抢信标。
 

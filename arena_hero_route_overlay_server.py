@@ -28,6 +28,7 @@ CONTROL_NUMBER_DEFAULTS = {
     "browser_hint_distance": 32,
     "browser_scout_limit": 1,
     "resource_leash_distance": 38,
+    "worker_search_max_radius": 160,
     "hoard_target_after_30": 0,
 }
 CONTROL_FLAG_DEFAULTS = {
@@ -91,6 +92,8 @@ EMPTY_STATS = {
     "browser_hint_distance": 32,
     "browser_scout_limit": 1,
     "resource_leash_distance": 38,
+    "worker_search_max_radius": 160,
+    "effective_worker_search_max_radius": 160,
     "browser_hints_beyond_leash": 0,
     "effective_target_population": 20,
     "composition_overflow": 0,
