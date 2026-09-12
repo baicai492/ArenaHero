@@ -1092,6 +1092,8 @@ class TacticMemory:
     yield_path_to_workers: bool = DEFAULT_YIELD_PATH_TO_WORKERS
     # 2026-08-27 通行调度（control 配置）：沿整条通路清障 + 递归推挤。
     traffic_control: bool = DEFAULT_TRAFFIC_CONTROL
+    # 2026-09-12 防御阵容一格一个单位（control 配置）：先锋游侠每格最多 1 个。
+    one_unit_per_cell: bool = DEFAULT_ONE_UNIT_PER_CELL
     # 2026-08-25 囤积改用容量判定（control 配置）：仓库装得下水位就开始攒。
     hoard_on_capacity: bool = DEFAULT_HOARD_ON_CAPACITY
     # 2026-08-25 人口过 30 后的通用囤积水位（control 配置），所有模式生效。
