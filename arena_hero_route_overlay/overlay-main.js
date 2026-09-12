@@ -40,6 +40,7 @@
     traffic_control: false,
     hoard_on_capacity: false,
     disable_beacon_scout: false,
+    one_unit_per_cell: false,
   };
   const core = globalThis.ArenaHeroOverlayCore;
   if (!core) {
@@ -529,6 +530,17 @@
       ? "游侠 → 先锋 → 工人（基础价降序，全局最省）"
       : "先锋 → 游侠 → 工人（项目原顺序）";
     return `\n当前生效：补缺口顺序 ${order}`;
+  }
+
+  // 一格一个单位的实时状态。
+  function oneUnitPerCellStatusText() {
+    const stats = state.stats;
+    if (!stats || typeof stats.one_unit_per_cell !== "boolean") {
+      return "";
+    }
+    return stats.one_unit_per_cell
+      ? "\n当前生效：防御阵容先锋游侠每格最多 1 个，已占格时向外扩环"
+      : "\n当前生效：未启用，阵位分配允许同格多单位";
   }
 
   // 编制阶梯的四个输入框显示"当前实际生效的那一级"，而不是控制文件里的原始
@@ -1191,6 +1203,21 @@
         "载货工人不会被推开；Core 5 格内有敌时整体让位于生存。" +
         "\n可与「优先给工人让路」同时开启：简单拥堵由让路先解决，剩下的才走调度器。" +
         trafficControlStatusText(),
+    );
+    addControlCheckbox(
+      panel,
+      "one_unit_per_cell",
+      "一格一个单位",
+      () =>
+        "勾选后，防御阵容的先锋和游侠每格最多 1 个，工人不受限。" +
+        "\n原防守逻辑会把先锋游侠拉到两圈固定坐标（先锋 Core 周围 1 格、游侠 2 格），" +
+        "人多时同格会挤好几个单位，一条路上同格同向的两个单位只有前面那个在打，" +
+        "后面的原地空放技能、打不到敌人，浪费 DPS。" +
+        "\n开关生效后，阵位坐标不变，但已占坑时后来者按曼哈顿距离向外扩环，" +
+        "保证驻留落点与阵位分配都不重叠；不拦穿行（调整阵型时允许暂时重叠）。" +
+        "\nCore 格照常能站 1 个工人卸货。工人采集、移动、穿行都不受约束。" +
+        "\n只影响防御阵容（先锋游侠），不影响工人，也不影响独立偷袭编组的行动。" +
+        oneUnitPerCellStatusText(),
     );
     addControlNumber(
       panel,

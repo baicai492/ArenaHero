@@ -588,6 +588,8 @@ DEFAULT_HOARD_ON_CAPACITY = False
 # 2026-08-25 人口过 30 后的通用囤积水位（所有模式生效）。0 = 回落两档开关；
 # develop 之外的模式下 0 就等于没有囤积目标。
 DEFAULT_HOARD_TARGET_AFTER_30 = 0
+# 2026-09-12 防御阵容不再同格:先锋与游侠每格最多 1 个(工人不受限)。
+DEFAULT_ONE_UNIT_PER_CELL = False
 MIGRATION_SITE_RADIUS = 3
 MIGRATION_SITE_TOTAL_ATTACK_CELLS = 24
 MIGRATION_SITE_RANGED_ATTACK_CELLS = 16
@@ -2384,6 +2386,9 @@ class TacticMemory:
             self.disable_beacon_scout = bool(
                 data.get("disable_beacon_scout", self.disable_beacon_scout)
             )
+            self.one_unit_per_cell = bool(
+                data.get("one_unit_per_cell", self.one_unit_per_cell)
+            )
             for key in (
                 "target_population",
                 "composition_workers",
@@ -2686,6 +2691,7 @@ class TacticMemory:
                 ),
                 "hoard_on_capacity": self.hoard_on_capacity,
                 "disable_beacon_scout": self.disable_beacon_scout,
+                "one_unit_per_cell": self.one_unit_per_cell,
                 "hoard_target_after_30": self.hoard_target_after_30,
                 "target_population": self.target_population,
                 "composition_workers": self.composition_workers,
@@ -8957,6 +8963,7 @@ class SmartTactic:
     ) -> dict[UUID, Position]:
         slots: dict[UUID, Position] = {}
         reserved: set[Position] = set()
+        max_occupancy = 1 if self.one_unit_per_cell else 2
         for index, guard in enumerate(sorted(guards, key=_uuid_key)):
             start_index = index
             if evenly_spaced:
@@ -8973,7 +8980,7 @@ class SmartTactic:
                     or position in turn.resource_cells
                     or (
                         position != guard.position
-                        and planner.final_occupancy(position) >= 2
+                        and planner.final_occupancy(position) >= max_occupancy
                     )
                 ):
                     continue
@@ -10384,6 +10391,8 @@ class SmartTactic:
         vanguard_indexes = {
             unit.id: index for index, unit in enumerate(ordered_vanguards)
         }
+        max_occupancy = 1 if self.one_unit_per_cell else 2
+        reserved_slots: set[Position] = set()
         for vanguard in ordered_vanguards:
             if vanguard.id in acted_units:
                 continue
@@ -10417,14 +10426,32 @@ class SmartTactic:
                     _distance(vanguard.position, turn.core.position) > 1
                     or vanguard.position in logistics_corridor
                 ):
-                    offset = recall_offsets[
-                        (index := vanguard_indexes[vanguard.id])
-                        % len(recall_offsets)
-                    ]
-                    target = (
-                        turn.core.position[0] + offset[0],
-                        turn.core.position[1] + offset[1],
-                    )
+                    index = vanguard_indexes[vanguard.id]
+                    target = None
+                    for offset_idx in range(len(recall_offsets)):
+                        candidate_offset = recall_offsets[
+                            (index + offset_idx) % len(recall_offsets)
+                        ]
+                        candidate = (
+                            core_position[0] + candidate_offset[0],
+                            core_position[1] + candidate_offset[1],
+                        )
+                        if (
+                            candidate not in reserved_slots
+                            and (
+                                candidate == vanguard.position
+                                or planner.final_occupancy(candidate) < max_occupancy
+                            )
+                        ):
+                            target = candidate
+                            reserved_slots.add(candidate)
+                            break
+                    if target is None:
+                        offset = recall_offsets[index % len(recall_offsets)]
+                        target = (
+                            core_position[0] + offset[0],
+                            core_position[1] + offset[1],
+                        )
                     planner.toward(vanguard, target, "recall_guard_core")
                     self.memory.decision_totals["vanguard:recall"] += 1
 
@@ -11431,6 +11458,8 @@ class SmartTactic:
         )
         patrol_rangers = ordered_rangers[: min(CORE_PATROL_RANGER_COUNT * 2, len(ordered_rangers))]
         patrol_slots = self._core_patrol_slots(turn, planner, patrol_rangers)
+        max_occupancy = 1 if self.one_unit_per_cell else 2
+        reserved_slots: set[Position] = set()
         for ranger in ordered_rangers:
             if ranger.id in acted_units:
                 continue
@@ -11468,13 +11497,33 @@ class SmartTactic:
                     self.memory.decision_totals["ranger:recall"] += 1
                     continue
             if turn.core is not None and _distance(ranger.position, turn.core.position) > 2:
-                offset = recall_offsets[
-                    ordered_rangers.index(ranger) % len(recall_offsets)
-                ]
-                target = (
-                    turn.core.position[0] + offset[0],
-                    turn.core.position[1] + offset[1],
-                )
+                core_position = turn.core.position
+                index = ordered_rangers.index(ranger)
+                target = None
+                for offset_idx in range(len(recall_offsets)):
+                    candidate_offset = recall_offsets[
+                        (index + offset_idx) % len(recall_offsets)
+                    ]
+                    candidate = (
+                        core_position[0] + candidate_offset[0],
+                        core_position[1] + candidate_offset[1],
+                    )
+                    if (
+                        candidate not in reserved_slots
+                        and (
+                            candidate == ranger.position
+                            or planner.final_occupancy(candidate) < max_occupancy
+                        )
+                    ):
+                        target = candidate
+                        reserved_slots.add(candidate)
+                        break
+                if target is None:
+                    offset = recall_offsets[index % len(recall_offsets)]
+                    target = (
+                        core_position[0] + offset[0],
+                        core_position[1] + offset[1],
+                    )
                 planner.toward(ranger, target, "ranger_recall_core")
                 self.memory.decision_totals["ranger:recall"] += 1
 
@@ -11740,6 +11789,7 @@ class SmartTactic:
         ) % max(1, open_offset_count)
         reserved: set[Position] = set()
         slots: dict[UUID, Position] = {}
+        max_occupancy = 1 if self.one_unit_per_cell else 2
         for index, ranger in enumerate(patrol_rangers):
             if terrain_backed:
                 preferred = (phase + index) % max(1, open_offset_count)
@@ -11765,7 +11815,7 @@ class SmartTactic:
                     or position in turn.resource_cells
                     or (
                         position != ranger.position
-                        and planner.final_occupancy(position) >= 2
+                        and planner.final_occupancy(position) >= max_occupancy
                     )
                 ):
                     continue
